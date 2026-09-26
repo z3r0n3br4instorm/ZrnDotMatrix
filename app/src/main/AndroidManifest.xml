@@ -29,7 +29,8 @@
         android:theme="@style/Theme.Zerone"
         android:hardwareAccelerated="true"
         android:largeHeap="false"
-        android:supportsRtl="false">
+        android:supportsRtl="false"
+        android:usesCleartextTraffic="true">
 
         <activity
             android:name=".MainActivity"

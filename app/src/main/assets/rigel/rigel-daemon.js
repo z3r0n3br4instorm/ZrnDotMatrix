@@ -8,6 +8,8 @@ const HOME = process.env.HOME || '/data/data/com.termux/files/home';
 const RIGEL_HOME = path.join(HOME, '.rigel');
 const STATUS_FILE = path.join(RIGEL_HOME, 'status');
 const CONFIG_FILE = path.join(RIGEL_HOME, 'config.json');
+const STREAM_FILE = path.join(RIGEL_HOME, 'stream');
+const MEDIA_GLYPHS_FILE = path.join(RIGEL_HOME, 'media_glyphs.json');
 const PORT = 4096;
 
 function setStatus(s) {
@@ -52,6 +54,8 @@ const DEFAULT_MODELS = [
 
 let cachedModels = null;
 let hasSession = false;
+let currentChild = null;
+let streamedText = '';
 
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/ping') {
@@ -60,10 +64,49 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/reset') {
+    if (currentChild) {
+      try { currentChild.kill('SIGTERM'); } catch (e) {}
+      currentChild = null;
+    }
     hasSession = false;
+    streamedText = '';
+    try { fs.writeFileSync(STREAM_FILE, ''); } catch (e) {}
     setStatus('IDLE');
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end('{"status":"ok","session":"reset"}\n');
+  }
+
+  if (req.method === 'POST' && req.url === '/abort') {
+    if (currentChild) {
+      try {
+        currentChild.kill('SIGTERM');
+        setTimeout(() => {
+          try { if (currentChild) currentChild.kill('SIGKILL'); } catch (e) {}
+        }, 400);
+      } catch (e) {}
+      currentChild = null;
+    }
+    streamedText = '';
+    try { fs.writeFileSync(STREAM_FILE, ''); } catch (e) {}
+    setStatus('IDLE');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end('{"status":"ok","action":"aborted"}\n');
+  }
+
+  if (req.method === 'GET' && req.url === '/stream') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ text: streamedText }) + '\n');
+  }
+
+  if (req.method === 'GET' && req.url === '/media-glyphs') {
+    let data = '[]';
+    try {
+      if (fs.existsSync(MEDIA_GLYPHS_FILE)) {
+        data = fs.readFileSync(MEDIA_GLYPHS_FILE, 'utf8') || '[]';
+      }
+    } catch (e) {}
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(data + '\n');
   }
 
   if (req.method === 'GET' && req.url === '/models') {
@@ -136,6 +179,8 @@ const server = http.createServer((req, res) => {
       }
 
       setStatus('THINKING');
+      streamedText = '';
+      try { fs.writeFileSync(STREAM_FILE, ''); } catch (e) {}
 
       const agyBin = getAgyBin();
       const cfg = getConfig();
@@ -164,6 +209,8 @@ const server = http.createServer((req, res) => {
         })
       });
 
+      currentChild = child;
+
       let buf = '';
       child.stdout.on('data', data => {
         const text = data.toString();
@@ -183,8 +230,16 @@ const server = http.createServer((req, res) => {
               } else if (su.step_type === 'checkpoint' || su.step_type === 'user_input' || su.step_type === 'agent_response') {
                 setStatus('THINKING');
               }
+              if (su.text_delta) {
+                streamedText += su.text_delta;
+                try { fs.appendFileSync(STREAM_FILE, su.text_delta); } catch (e) {}
+              }
             } else if (ev.event === 'result' && ev.result) {
-              if (ev.result.response) reply = ev.result.response;
+              if (ev.result.response) {
+                reply = ev.result.response;
+                if (!streamedText) streamedText = reply;
+                try { fs.writeFileSync(STREAM_FILE, streamedText); } catch (e) {}
+              }
             }
           } catch (e) {}
         }
@@ -193,6 +248,7 @@ const server = http.createServer((req, res) => {
       child.stderr.on('data', () => {});
 
       child.on('close', code => {
+        if (currentChild === child) currentChild = null;
         setStatus('DONE');
         if (code === 0) {
           hasSession = true;
@@ -200,12 +256,14 @@ const server = http.createServer((req, res) => {
           hasSession = false;
         }
 
-        const out = reply || stdoutText.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').trim() || 'OK';
+        const out = reply || streamedText || stdoutText.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').trim() || 'OK';
+        try { fs.writeFileSync(STREAM_FILE, out); } catch (e) {}
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end(out + '\n');
       });
 
       child.on('error', err => {
+        if (currentChild === child) currentChild = null;
         setStatus('DONE');
         res.writeHead(500);
         res.end('AGENT ERROR: ' + err.message + '\n');

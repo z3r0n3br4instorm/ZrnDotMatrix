@@ -26,9 +26,15 @@
     toggleRadio: (w) => (N && N.toggleRadio ? N.toggleRadio(w) : false),
     tiltAvailable: () => (N && N.tiltAvailable ? N.tiltAvailable() : false),
     setTiltWanted: (v) => { if (N && N.setTiltWanted) N.setTiltWanted(v); },
+    version: () => (N && N.version ? N.version() : 'v0.1.2'),
     rigelExec: (id, cmd) => { if (N && N.rigelExec) N.rigelExec(id, cmd); },
     rigelAsk: (id, b64) => { if (N && N.rigelAsk) N.rigelAsk(id, b64); },
     rigelReady: (id) => { if (N && N.rigelReady) N.rigelReady(id); },
+    rigelReset: (id) => { if (N && N.rigelReset) N.rigelReset(id); },
+    rigelModels: (id) => { if (N && N.rigelModels) N.rigelModels(id); },
+    rigelSetModel: (id, m) => { if (N && N.rigelSetModel) N.rigelSetModel(id, m); },
+    rigelAbort: () => { if (N && N.rigelAbort) N.rigelAbort(); },
+    mediaGlyphs: (id) => { if (N && N.mediaGlyphs) N.mediaGlyphs(id); },
     rigelSetup: (b) => (N && N.rigelSetup ? N.rigelSetup(b) : false),
     rigelInstall: (id, b) => { if (N && N.rigelInstall) N.rigelInstall(id, b); },
     rigelAgySetup: () => (N && N.rigelAgySetup ? N.rigelAgySetup() : false),
@@ -43,7 +49,7 @@
     getConfig: () => {
       const defaults = {
         launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true,
-        haptics: true, hapticLevel: 'med', agentic: 'agy', amoled: false, speak: false, musicApp: 'auto', chatApp: 'auto'
+        haptics: true, hapticLevel: 'med', agentic: 'agy', amoled: false, speak: false, streamRigel: true, musicApp: 'auto', chatApp: 'auto'
       };
       try {
         return Object.assign(defaults, JSON.parse(store.get('zlConfig') || '{}'));

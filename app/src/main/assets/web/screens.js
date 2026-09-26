@@ -429,8 +429,14 @@ function parseRigelResponse(raw) {
   P.rigelStop = function () {
     this.rigel.state = 'idle';
     this.rigel.busy = false;
+    this.rigel.thinking = false;
+    this.rigel.callingTool = false;
+    this.rigel.spokenIndex = 0;
     this.rigel.note = 'STOPPED';
     this.rigel.since = Date.now();
+    if (this.bridge.rigelAbort) this.bridge.rigelAbort();
+    if (this.bridge.voiceStop) this.bridge.voiceStop();
+    if (this.bridge.voiceShutUp) this.bridge.voiceShutUp();
     if (this.bridge.hapticTransition) this.bridge.hapticTransition();
     this.lastKey = null;
   };
@@ -486,10 +492,115 @@ function parseRigelResponse(raw) {
     g.text3fit(hint, 5, 62, 134, (r.note || isTool) ? 2 : (isThinking ? 1 : 3), A);
   };
 
+  const NEURON_NODES = [
+    [0, 0],           // 0: central soma
+    [-0.7, -0.65],    // 1: top-left
+    [0, -0.85],       // 2: top
+    [0.7, -0.65],     // 3: top-right
+    [-0.85, 0.05],    // 4: mid-left
+    [0.85, -0.05],    // 5: mid-right
+    [-0.65, 0.7],     // 6: bot-left
+    [0, 0.88],        // 7: bottom
+    [0.65, 0.7],      // 8: bot-right
+    [-0.35, -0.3],    // 9: inner top-left
+    [0.35, -0.3],     // 10: inner top-right
+    [-0.35, 0.35],    // 11: inner bot-left
+    [0.35, 0.35]      // 12: inner bot-right
+  ];
+
+  const NEURON_EDGES = [
+    // center to inner
+    [0, 9], [0, 10], [0, 11], [0, 12],
+    // inner to outer dendrites
+    [9, 1], [9, 2], [9, 4],
+    [10, 2], [10, 3], [10, 5],
+    [11, 4], [11, 6], [11, 7],
+    [12, 5], [12, 7], [12, 8],
+    // lateral loops
+    [1, 2], [2, 3], [3, 5], [5, 8], [8, 7], [7, 6], [6, 4], [4, 1]
+  ];
+
   /**
-   * The RIGEL mark: ten orbital rings drawn as dot outlines. Tilting the phone slides the
-   * rings against each other — the small inner rings travel furthest, so the mark reads as
-   * having depth rather than being a flat sticker.
+   * Neural network thinking visualization: dots rearranged into an interconnected
+   * cortical lattice with firing somas and red action potential pulses racing along dendrites.
+   */
+  P.drawNeuralNetwork = function (g, A, cx, cy, rad, travel) {
+    const t = this.tilt || { x: 0, y: 0 };
+    const breathe = 1 + 0.03 * Math.sin(A / 600);
+    const scale = rad * breathe;
+    const tx = travel === undefined ? 5.0 : travel;
+    const ox = -t.x * tx * 0.45;
+    const oy = t.y * tx * 0.35;
+
+    const coords = [];
+    for (let i = 0; i < NEURON_NODES.length; i++) {
+      const n = NEURON_NODES[i];
+      const driftX = Math.sin(A / 500 + i * 1.4) * (rad > 16 ? 0.9 : 0.4);
+      const driftY = Math.cos(A / 650 + i * 1.1) * (rad > 16 ? 0.9 : 0.4);
+      coords.push([
+        cx + n[0] * scale + ox + driftX,
+        cy + n[1] * scale + oy + driftY
+      ]);
+    }
+
+    // Synaptic dendrite pathways
+    for (let e = 0; e < NEURON_EDGES.length; e++) {
+      const [i1, i2] = NEURON_EDGES[e];
+      const p1 = coords[i1], p2 = coords[i2];
+      const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+      const dist = Math.hypot(dx, dy);
+      const steps = Math.max(3, Math.round(dist * 1.1));
+      for (let s = 1; s < steps; s++) {
+        const u = s / steps;
+        g.set(p1[0] + dx * u, p1[1] + dy * u, 3);
+      }
+    }
+
+    // Action potential pulses travelling through dendrites
+    for (let e = 0; e < NEURON_EDGES.length; e++) {
+      const [i1, i2] = NEURON_EDGES[e];
+      const p1 = coords[i1], p2 = coords[i2];
+      const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
+
+      const speed = 0.0016 + (e % 5) * 0.0003;
+      const phase = ((A * speed + e * 0.28) % 1.0);
+
+      const hx = p1[0] + dx * phase;
+      const hy = p1[1] + dy * phase;
+
+      // Bright red dot for action potential pulse
+      g.set(Math.round(hx), Math.round(hy), 9);
+
+      // Amber depolarizing trail
+      const trailPhase = phase - 0.12;
+      if (trailPhase > 0) {
+        const txp = p1[0] + dx * trailPhase;
+        const typ = p1[1] + dy * trailPhase;
+        g.set(Math.round(txp), Math.round(typ), 5);
+      }
+    }
+
+    // Neuron somas (cell bodies)
+    for (let i = 0; i < coords.length; i++) {
+      const [nx, ny] = coords[i];
+      const isFiring = Math.sin(A / 220 + i * 1.8) > 0.65;
+      const somaV = isFiring ? 9 : 1;
+
+      g.set(Math.round(nx), Math.round(ny), somaV);
+
+      if (rad >= 16) {
+        const ringV = isFiring ? 5 : 2;
+        g.set(Math.round(nx) - 1, Math.round(ny), ringV);
+        g.set(Math.round(nx) + 1, Math.round(ny), ringV);
+        g.set(Math.round(nx), Math.round(ny) - 1, ringV);
+        g.set(Math.round(nx), Math.round(ny) + 1, ringV);
+      }
+    }
+  };
+
+  /**
+   * The RIGEL mark: orbital rings at rest, or an interconnected neuron connection
+   * grid firing action potentials while thinking.
    */
   P.drawRigelMark = function (g, A, cx, cy, rad, travel) {
     const t = this.tilt || { x: 0, y: 0 };
@@ -499,15 +610,17 @@ function parseRigelResponse(raw) {
     const isBusy = this.rigel.busy || this.rigel.state === 'busy';
     const isTool = !!this.rigel.callingTool;
     const isThinking = (this.rigel.thinking || isBusy) && !isTool;
-    const frame = Math.floor(A / 55);
+
+    if (isThinking) {
+      this.drawNeuralNetwork(g, A, cx, cy, rad, tx);
+      if (isTool) this.drawCogwheel(g, A, cx, cy);
+      return;
+    }
 
     RIGEL_RINGS.forEach((ring) => {
       // depth: 1 for the smallest (front) ring, ~0 for the outermost
       const depth = Math.max(0, Math.min(1, (1.05 - ring.e) / 0.53));
       const ox = -t.x * tx * depth, oy = t.y * tx * 0.6 * depth;
-      // White for the front rings, dim for the ones behind. Deliberately no accent: in
-      // the Mono palette accent is red, which made the mark read as an alert rather than
-      // as depth. Red stays reserved for warnings and the fire.
       let v = depth > 0.55 ? 1 : 3;
       const pts = ring.p;
       // One dot per grid cell of arc, so big and small rings look equally dense.
@@ -517,19 +630,7 @@ function parseRigelResponse(raw) {
         const q = pts[Math.floor(k * step)];
         let px = cx + q[0] * R + ox;
         let py = cy + q[1] * R + oy;
-        let pv = v;
-
-        if (isThinking) {
-          // Glitch tear effect inspired by rippleFx: row tearing and dropped dots
-          const row = Math.round(py);
-          if (hash(row, frame, 19) < 0.28) {
-            px += (hash(row, frame, 29) < 0.5 ? -2 : 2);
-          }
-          if (hash(Math.round(px), Math.round(py), frame) < 0.16) continue;
-          if (hash(row, frame, 41) < 0.08) pv = 9;
-        }
-
-        g.set(px, py, pv);
+        g.set(px, py, v);
       }
     });
 
@@ -754,7 +855,17 @@ function parseRigelResponse(raw) {
     }
     if (this.rigelStatusId && id === this.rigelStatusId) {
       this.rigelStatusId = null;
-      const line = (stdout || '').trim().split('\n').pop() || '';
+      const raw = (stdout || '').trim();
+      let line = raw;
+      let streamText = '';
+      if (raw.indexOf('---RIGEL_STREAM---') >= 0) {
+        const parts = raw.split('---RIGEL_STREAM---');
+        line = parts[0].trim().split('\n').pop() || '';
+        streamText = (parts[1] || '').trim();
+      } else {
+        line = raw.split('\n').pop() || '';
+      }
+
       if (line && line !== 'NONE') {
         this.rigel.status = line;
         if (line.indexOf('TOOL') >= 0) {
@@ -763,9 +874,39 @@ function parseRigelResponse(raw) {
         } else if (line.indexOf('THINKING') >= 0) {
           this.rigel.callingTool = false;
           this.rigel.thinking = true;
+        } else if (line.indexOf('DONE') >= 0 || line.indexOf('IDLE') >= 0) {
+          this.rigel.callingTool = false;
+          this.rigel.thinking = false;
         }
       }
-      if (this.rigel.busy) setTimeout(() => this.rigelPollStatus(), 350);
+
+      // Stream live response tokens if streamRigel is enabled
+      if (this.config.streamRigel !== false && streamText) {
+        const parsed = parseRigelResponse(streamText);
+        if (parsed.text) {
+          this.rigel.reply = parsed.text.slice(-1200);
+          this.rigel.thinking = false;
+        }
+        if (parsed.glyph) {
+          this.rigel.currentGlyph = parsed.glyph;
+        }
+
+        // Transcribe by buffering the stream for speech
+        if (this.config.speak && this.bridge.voiceSpeak && this.rigel.reply) {
+          const spokenIdx = this.rigel.spokenIndex || 0;
+          const unuttered = this.rigel.reply.slice(spokenIdx);
+          const punctMatch = unuttered.search(/[\.\!\?\n]\s+/);
+          if (punctMatch !== -1 && punctMatch > 6) {
+            const chunk = unuttered.slice(0, punctMatch + 1).trim();
+            if (chunk) {
+              this.bridge.voiceSpeak(chunk);
+              this.rigel.spokenIndex = spokenIdx + punctMatch + 1;
+            }
+          }
+        }
+      }
+
+      if (this.rigel.busy) setTimeout(() => this.rigelPollStatus(), 250);
       else if (this.rigel.installing) setTimeout(() => this.rigelPollStatus(), 1500);
       this.lastKey = null;
       return true;
@@ -788,12 +929,28 @@ function parseRigelResponse(raw) {
         this.rigel.reply = parsed.text.slice(-1200);
         this.rigel.currentGlyph = parsed.glyph;
         this.rigel.note = this.rigel.reply ? '' : 'NO REPLY';
-        // Read it back unless the user muted RIGEL.
+        // Read it back or flush remaining unuttered speech
         if (this.rigel.reply && this.config.speak && this.bridge.voiceSpeak) {
-          this.bridge.voiceSpeak(this.rigel.reply.slice(0, 400));
+          const spokenIdx = this.rigel.spokenIndex || 0;
+          const remainder = this.rigel.reply.slice(spokenIdx).trim();
+          if (remainder) {
+            this.bridge.voiceSpeak(remainder.slice(0, 400));
+          }
         }
       }
+      this.rigel.spokenIndex = 0;
+      this.refreshMediaGlyphs();
       this.rigel.askId = null;
+      this.lastKey = null;
+      return true;
+    }
+    if (id && id.indexOf('mediaglyphs') >= 0) {
+      try {
+        const rawJson = (stdout || '').trim();
+        if (rawJson && (rawJson.startsWith('[') || rawJson.startsWith('{'))) {
+          this.mediaGlyphs = JSON.parse(rawJson);
+        }
+      } catch (e) {}
       this.lastKey = null;
       return true;
     }
@@ -844,11 +1001,31 @@ function parseRigelResponse(raw) {
     this.rigel.state = 'busy';
     this.rigel.thinking = true;
     this.rigel.callingTool = false;
+    this.rigel.spokenIndex = 0;
     this.rigel.note = '';
     this.rigel.reply = '';
     this.bridge.rigelAsk(id, b64(prompt));
     this.rigelPollStatus();
     this.lastKey = null;
+  };
+
+  P.refreshMediaGlyphs = function () {
+    if (this.bridge && this.bridge.mediaGlyphs) {
+      this.bridge.mediaGlyphs('mediaglyphs' + Date.now());
+    }
+  };
+
+  P.getMediaGlyph = function (track, artist) {
+    if (!this.mediaGlyphs || !this.mediaGlyphs.length) return null;
+    const hay = ((track || '') + ' ' + (artist || '')).toLowerCase();
+    if (!hay.trim()) return null;
+    for (let i = 0; i < this.mediaGlyphs.length; i++) {
+      const rule = this.mediaGlyphs[i];
+      if (rule && rule.contains && hay.indexOf(rule.contains.toLowerCase()) >= 0) {
+        return rule.glyph;
+      }
+    }
+    return null;
   };
 
   P.drawRigelSetup = function (g, A) {
@@ -862,10 +1039,10 @@ function parseRigelResponse(raw) {
 
     // ---- state ----
     const curModel = (cfg && cfg.model) || this.rigel.model || 'gemini-3.8-flash-low';
+    const isStream = this.config.streamRigel !== false;
     const rows = [
       ['TERMUX', blocked ? 'NOT ACCEPTING' : 'PRESENT'],
-      ['KEY', cfg && cfg.key ? 'STORED' : 'NOT SET'],
-      ['PROVIDER', cfg ? String(cfg.provider || '?').toUpperCase() : '-'],
+      ['STREAMING', isStream ? 'ENABLED' : 'DISABLED'],
       ['MODEL', curModel.toUpperCase().slice(0, 20)],
       ['RUNNING VIA', cfg && cfg.backend ? String(cfg.backend).toUpperCase() : '-']
     ];
@@ -878,8 +1055,17 @@ function parseRigelResponse(raw) {
         g.text3(mStr, 125 - mw, y, 1);
         this.hits.push([46, y - 2, 85, y + 8, () => this.rigelCycleModel(-1)]);
         this.hits.push([86, y - 2, 128, y + 8, () => this.rigelCycleModel(1)]);
+      } else if (r[0] === 'STREAMING') {
+        const sStr = '< ' + r[1] + ' >';
+        const sw = DotGrid.width3(sStr);
+        g.text3(sStr, 125 - sw, y, isStream ? 1 : 3);
+        this.hits.push([60, y - 2, 128, y + 8, () => {
+          this.config.streamRigel = !isStream;
+          this.bridge.saveConfig(this.config);
+          this.lastKey = null;
+        }]);
       } else {
-        const good = r[1] === 'PRESENT' || r[1] === 'STORED';
+        const good = r[1] === 'PRESENT' || r[1] === 'STORED' || r[1] === 'ENABLED';
         g.text3(r[1], 125 - DotGrid.width3(r[1]), y, good ? 1 : 2);
       }
     });

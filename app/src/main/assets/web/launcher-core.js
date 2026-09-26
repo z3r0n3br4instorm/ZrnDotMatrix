@@ -916,7 +916,7 @@ class Launcher {
     const top = Math.round(this.s.rows / 2) - 10;
     ZERONE.forEach((Lg, i) => g.bmp(Lg, 10 + i * 8, top, 1));
     g.text3c('ZrnDotMatrix', 33.5, top + 10, 1);
-    const ver = this.bridge.version ? this.bridge.version() : 'v0.1.0';
+    const ver = this.bridge.version ? this.bridge.version() : 'v0.1.2';
     g.text3c(ver, 33.5, top + 17, 3);
     return g;
   }
@@ -1080,17 +1080,6 @@ class Launcher {
         }
         // Draw the mini Rigel mark
         this.drawRigelMark(g, A, 33.5, cy - 7, 13, 2.0);
-        // Draw concentric listening rings radiating outward
-        const ripStage = (A % 1100) / 1100;
-        const ripRad = Math.round(11 + ripStage * 13);
-        for (let a = 0; a < 24; a++) {
-          const ang = (a / 24) * Math.PI * 2;
-          const rx = Math.round(33.5 + Math.cos(ang) * ripRad);
-          const ry = Math.round((cy - 7) + Math.sin(ang) * ripRad * 0.65);
-          if (rx >= MID_L && rx <= MID_R && ry >= 48 && ry <= ctrlY - 2) {
-            g.set(rx, ry, ripStage > 0.6 ? 3 : 2);
-          }
-        }
         const said = (this.rigel.heard || 'LISTENING...').toUpperCase();
         g.text3fit(said, MID_L, MID_R, cy + 11, 1, A);
         g.text3fit('HOLD TO DISMISS', MID_L, MID_R, cy + 18, 3, A);
@@ -1164,7 +1153,15 @@ class Launcher {
     const nb = bands.length;
     const frame = Math.floor(A / 55);
 
-    g.text3fit(this.audioLive ? 'NOW PLAYING' : 'NO AUDIO TAP', MID_L, MID_R, base - maxH - 7, 3, A);
+    const customGlyph = typeof this.getMediaGlyph === 'function' ? this.getMediaGlyph(this.status.track, this.status.artist) : null;
+    const glyphBmp = customGlyph && typeof getRigelGlyph === 'function' ? getRigelGlyph(customGlyph) : null;
+    if (glyphBmp) {
+      const gw = glyphBmp[0].length, gh = glyphBmp.length;
+      g.bmp(glyphBmp, Math.round(33.5 - gw / 2), base - maxH - 18, 1);
+      g.text3fit(this.audioLive ? 'NOW PLAYING' : 'NO AUDIO TAP', MID_L, MID_R, base - maxH - 6, 3, A);
+    } else {
+      g.text3fit(this.audioLive ? 'NOW PLAYING' : 'NO AUDIO TAP', MID_L, MID_R, base - maxH - 7, 3, A);
+    }
 
     const span = MID_R - MID_L;
     for (let c = MID_L; c <= MID_R; c++) {
@@ -1427,13 +1424,16 @@ class Launcher {
         this.config.speak = !this.config.speak;
         if (!this.config.speak && this.bridge.voiceShutUp) this.bridge.voiceShutUp();
       }},
+      { label: 'STREAM RIGEL', val: this.config.streamRigel !== false ? 'ON' : 'OFF', toggle: () => {
+        this.config.streamRigel = this.config.streamRigel === false ? true : false;
+      }},
       { label: 'AGENTIC BACKEND', val: this.agenticStep().label, toggle: () => {
         const i = AGENTIC_BACKENDS.indexOf(this.agenticStep());
         this.config.agentic = AGENTIC_BACKENDS[(i + 1) % AGENTIC_BACKENDS.length].id;
       }}
     ];
 
-    sysRows.forEach((row, i) => this.settingsRow(g, row, 118 + i * 11));
+    sysRows.forEach((row, i) => this.settingsRow(g, row, 116 + i * 10));
 
     g.text3('* BETA', 12, 191, 3);
     g.hline(8, 127, 198, 3, 2);

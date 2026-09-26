@@ -210,9 +210,15 @@ class Bridge(private val act: MainActivity) {
     @JavascriptInterface fun location(): String = location(act)?.let { "${it.first},${it.second}" } ?: ""
 
     @JavascriptInterface fun version(): String = try {
-        "v" + pm.getPackageInfo(act.packageName, 0).versionName
+        val ver = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getPackageInfo(act.packageName, PackageManager.PackageInfoFlags.of(0)).versionName
+        } else {
+            @Suppress("DEPRECATION")
+            pm.getPackageInfo(act.packageName, 0).versionName
+        }
+        "v" + ver
     } catch (_: Exception) {
-        "v0.1.0"
+        "v0.1.2"
     }
 
     /** Page finished loading: push status and location once. */
@@ -338,14 +344,20 @@ class Bridge(private val act: MainActivity) {
     @JavascriptInterface fun setTiltWanted(v: Boolean) = act.runOnUiThread { act.tiltWanted = v }
 
     private fun buildRigelAssetsPush(): String {
-        val push = StringBuilder("mkdir -p \$HOME/.rigel/bin \$HOME/.rigel/out \$HOME/.rigel/memory \$HOME/.gemini/config/skills/natural-response \$HOME/.gemini/config/skills/rigel-glyphs \$HOME/.agents/skills/natural-response \$HOME/.agents/skills/rigel-glyphs")
+        val push = StringBuilder("mkdir -p \$HOME/.rigel/bin \$HOME/.rigel/out \$HOME/.rigel/memory " +
+            "\$HOME/.gemini/config/skills/natural-response \$HOME/.gemini/config/skills/rigel-glyphs " +
+            "\$HOME/.gemini/config/skills/termux-api \$HOME/.gemini/config/skills/media-glyphs " +
+            "\$HOME/.agents/skills/natural-response \$HOME/.agents/skills/rigel-glyphs " +
+            "\$HOME/.agents/skills/termux-api \$HOME/.agents/skills/media-glyphs")
         val files = listOf(
             "rigel-run.sh" to listOf("\$HOME/.rigel/bin/rigel-run"),
             "rigel-install.sh" to listOf("\$HOME/.rigel/bin/rigel-install"),
             "rigel-daemon.js" to listOf("\$HOME/.rigel/bin/rigel-daemon.js"),
             "AGENTS.md" to listOf("\$HOME/AGENTS.md", "\$HOME/.gemini/config/AGENTS.md"),
             "skills/natural-response/SKILL.md" to listOf("\$HOME/.gemini/config/skills/natural-response/SKILL.md", "\$HOME/.agents/skills/natural-response/SKILL.md"),
-            "skills/rigel-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/rigel-glyphs/SKILL.md", "\$HOME/.agents/skills/rigel-glyphs/SKILL.md")
+            "skills/rigel-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/rigel-glyphs/SKILL.md", "\$HOME/.agents/skills/rigel-glyphs/SKILL.md"),
+            "skills/termux-api/SKILL.md" to listOf("\$HOME/.gemini/config/skills/termux-api/SKILL.md", "\$HOME/.agents/skills/termux-api/SKILL.md"),
+            "skills/media-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/media-glyphs/SKILL.md", "\$HOME/.agents/skills/media-glyphs/SKILL.md")
         )
         for ((asset, dests) in files) {
             val body = try {
@@ -376,9 +388,23 @@ class Bridge(private val act: MainActivity) {
         runTermux(id, cmd)
     }
 
-    /** One line of install progress, polled by the UI while a backend is being set up. */
+    /** One line of install progress + streamed text buffer, polled by the UI. */
     @JavascriptInterface
-    fun rigelStatus(id: String) = runTermux(id, "cat \$HOME/.rigel/status 2>/dev/null || echo NONE")
+    fun rigelStatus(id: String) = runTermux(id, "cat \$HOME/.rigel/status 2>/dev/null || echo NONE; echo '---RIGEL_STREAM---'; cat \$HOME/.rigel/stream 2>/dev/null || true")
+
+    /** Abort running RIGEL turn and kill the underlying agy process */
+    @JavascriptInterface
+    fun rigelAbort() {
+        val cmd = "curl -s -m 1 -X POST http://127.0.0.1:4096/abort >/dev/null 2>&1 || true; pkill -f agy >/dev/null 2>&1 || true; echo IDLE > \$HOME/.rigel/status; rm -f \$HOME/.rigel/stream 2>/dev/null || true"
+        runTermux("rigelabort", cmd)
+    }
+
+    /** Load custom media glyph configuration from Termux */
+    @JavascriptInterface
+    fun mediaGlyphs(id: String) {
+        val cmd = "cat \$HOME/.rigel/media_glyphs.json 2>/dev/null || echo '[]'"
+        runTermux(id, cmd)
+    }
 
     /** Reset RIGEL session so user can start a fresh conversation */
     @JavascriptInterface
