@@ -1,0 +1,24 @@
+# Android / Gradle
+*.iml
+.gradle/
+build/
+**/build/
+dist/
+# Machine-specific SDK path
+local.properties
+.cxx/
+captures/
+.externalNativeBuild/
+
+# Signing material — never commit these
+*.jks
+*.keystore
+keystore.properties
+
+# IDE
+.idea/
+*.hprof
+
+# OS
+.DS_Store
+Thumbs.db

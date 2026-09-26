@@ -1,0 +1,66 @@
+name: Build and Deploy APKs
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Deploy APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug & Release APKs
+        run: ./gradlew assembleDebug assembleRelease --stacktrace
+
+      - name: Rename APKs for distribution
+        run: |
+          mkdir -p dist
+          cp app/build/outputs/apk/release/app-release.apk dist/ZrnDotMatrix-release.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/ZrnDotMatrix-debug.apk
+
+      - name: Upload APKs as Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZrnDotMatrix-APKs
+          path: dist/*.apk
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'ZrnDotMatrix Latest Build' }}
+          body: |
+            Automated continuous deployment build for ZrnDotMatrix (ZERONE Launcher).
+            
+            ### Included APKs:
+            - **ZrnDotMatrix-release.apk** (Optimized release build)
+            - **ZrnDotMatrix-debug.apk** (Debug build with logging)
+          draft: false
+          prerelease: false
+          files: dist/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

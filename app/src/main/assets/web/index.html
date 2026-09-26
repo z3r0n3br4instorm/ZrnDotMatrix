@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>ZERONE</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#dm{position:fixed;left:0;top:0;display:block}
+#vig{position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse at 50% 50%,rgba(0,0,0,0) 65%,rgba(0,0,0,.45) 100%)}
+html[data-amoled="1"] #vig{display:none}
+</style>
+</head>
+<body>
+<canvas id="dm"></canvas>
+<div id="vig"></div>
+<script src="engine.js"></script>
+<script src="icons.js"></script>
+<script src="launcher-core.js"></script>
+<script src="rigel-logo.js"></script>
+<script src="screens.js"></script>
+<script src="renderer.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
