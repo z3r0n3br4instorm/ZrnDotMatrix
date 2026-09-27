@@ -31,6 +31,8 @@
     tiltAvailable: () => (N && N.tiltAvailable ? N.tiltAvailable() : false),
     setTiltWanted: (v) => { if (N && N.setTiltWanted) N.setTiltWanted(v); },
     setShakeWanted: (v) => { if (N && N.setShakeWanted) N.setShakeWanted(v); },
+    uiReady: () => { if (N && N.uiReady) N.uiReady(); },
+    fingerprintSensor: () => { try { return N && N.fingerprintSensor ? JSON.parse(N.fingerprintSensor()) : null; } catch (e) { return null; } },
     version: () => (N && N.version ? N.version() : 'v0.2.1.dev.1'),
     rigelExec: (id, cmd) => { if (N && N.rigelExec) N.rigelExec(id, cmd); },
     rigelAsk: (id, b64) => { if (N && N.rigelAsk) N.rigelAsk(id, b64); },
@@ -58,7 +60,8 @@
     getConfig: () => {
       const defaults = {
         launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true,
-        haptics: true, hapticLevel: 'med', agentic: 'agy', amoled: false, speak: false, streamRigel: true, musicApp: 'auto', chatApp: 'auto'
+        haptics: true, hapticLevel: 'med', agentic: 'agy', amoled: false, speak: false, streamRigel: true, musicApp: 'auto', chatApp: 'auto',
+        bootSeed: 'random'          // where the boot dots come from: 'random' or 'fp'
       };
       try {
         return Object.assign(defaults, JSON.parse(store.get('zlConfig') || '{}'));
@@ -90,6 +93,7 @@
   window.ZL = {
     onStatus(json) { L.onStatus(json); },
     onApps(json) { L.onApps(json); },                       // app cache finished building
+    uiShown() { L.uiShown = true; },                        // native: frame 0 composited, cover down
     onShake(mag) { if (L.onShake) L.onShake(mag); },         // accelerometer jolt, drives scenes
     onAudio(json) { L.onAudio(json); },                     // live FFT from AudioCapture
     onTilt(x, y) { L.onTilt(x, y); },                       // accelerometer, drives RIGEL parallax
@@ -99,9 +103,9 @@
     launchFailed() { L.launchFailed(); },                   // nothing handled the launch intent
     rigelSetupFailed(why) { L.rigelSetupFailed(why); },
     onTermux(id, out, err, code, e) { L.onTermux(id, out, err, code, e); },
-    wake() { L.splash(); tickStart(); },                    // screen turned on
-    pause() { L.pausedAt = Date.now(); tickStop(); },        // activity backgrounded
-    resume() { tickStart(); L.resumeHome(); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); if (L.refreshScenes) L.refreshScenes(); },              // back on top: replay the closing morph
+    wake() { pipelineReset(); L.splash(); tickStart(); },    // screen turned on
+    pause() { L.pausedAt = Date.now(); pipelineReset(); tickStop(); },
+    resume(wakeOwed) { pipelineReset(); tickStart(); L.resumeHome(wakeOwed); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); if (L.refreshScenes) L.refreshScenes(); },   // back on top: replay the closing morph
     home() { L.home(); },                                   // home pressed while already home
     settings() { L.openSettings(); },                       // open hidden settings
     back() { return L.back(); },
@@ -155,7 +159,7 @@
   canvas.addEventListener('pointerdown', (e) => {
     const p = pos(e); down = { x: p[0], y: p[1], x0: p[0], y0: p[1], moved: false, held: false, swiped: false };
     clearTimeout(holdT);
-    holdT = setTimeout(() => { if (down && !down.moved) { down.held = L.hold(down.x, down.y); if (down.held && N && N.haptic) N.haptic(); } }, 600);
+    holdT = setTimeout(() => { if (down && !down.moved) { down.held = L.hold(down.x, down.y); if (down.held && N && N.haptic) N.haptic(); } kick(); }, 600);
   });
   const SWIPE_X = 55;                                        // px before a drag counts as a swipe
   canvas.addEventListener('pointermove', (e) => {
@@ -184,23 +188,60 @@
   // ---- frame loop: GPU draw only when something changed, and only while we are on top ----
   let last = 0, emaGpu = 16, rafId = 0, ticking = false;
   let lastGpuPush = 0;
+  // Frames that arrived on time, back to back. After a deep sleep the first few rAF callbacks
+  // fire long before the compositor is presenting, so the launcher waits for this to prove the
+  // pipeline is live before it starts an animation the user would otherwise never see.
+  let goodFrames = 0, pipelineSince = 0;
+  const PIPELINE_FRAMES = 3;
+  const PIPELINE_GIVEUP = 1200;      // never hold an animation longer than this, whatever rAF says
+  function pipelineReset() { goodFrames = 0; pipelineSince = 0; L.pipelineReady = false; }
   // Idempotent on purpose: ZL.pause() is delivered through evaluateJavascript and may not
   // land before the WebView suspends, so resume must always re-arm a live frame request
   // rather than trusting the flag.
+  // ---- demand-driven frame loop ----
+  // The loop used to request an animation frame on every vsync forever and let L.frame()
+  // decide there was nothing to draw. An outstanding rAF keeps Chromium's whole frame
+  // pipeline (renderer main thread, Viz, the GPU thread) waking 60 times a second, which
+  // measured ~50% of a CPU core on an idle home screen. Now it runs every vsync only while
+  // something is actually moving, and otherwise sleeps until the next change is due:
+  // the next blink edge from L.nextWakeMs(), or any event, input or state change, which
+  // wakes it straight away through kick().
+  let wakeT = 0;
+  function kick() {                                         // something changed: draw next vsync
+    if (!ticking) return;
+    if (wakeT) { clearTimeout(wakeT); wakeT = 0; }
+    if (!rafId) rafId = requestAnimationFrame(loop);
+  }
+  function sleepFor(ms) {
+    if (!ticking || rafId) return;                          // a frame is already on its way
+    if (wakeT) clearTimeout(wakeT);
+    wakeT = setTimeout(() => { wakeT = 0; kick(); }, ms);
+  }
   function tickStart() {
     ticking = true; last = 0;
     if (rafId) cancelAnimationFrame(rafId);
-    rafId = requestAnimationFrame(loop);
+    rafId = 0;
+    kick();
   }
   function tickStop() {
     ticking = false;
     if (rafId) cancelAnimationFrame(rafId);
     rafId = 0;
+    if (wakeT) { clearTimeout(wakeT); wakeT = 0; }
   }
   function loop(ts) {
-    if (!ticking) return;                                   // stopped: do not queue another frame
-    rafId = requestAnimationFrame(loop);
-    if (document.hidden || ts - last < 16) return;
+    rafId = 0;
+    if (!ticking || document.hidden) return;                // visibilitychange kicks us back
+    // Frame-rate cap. It was 15ms, meant as "about 60fps" — but on a 90Hz panel vsyncs are
+    // 11ms apart, so skipping anything under 15ms dropped every other frame and animations
+    // ran at 45fps. 10ms lets a 90Hz panel run every vsync (90fps) and still halves 120Hz to
+    // 60. Idle cost is unaffected: an unchanged screen doesn't request frames at all.
+    if (ts - last < 10) { rafId = requestAnimationFrame(loop); return; }
+    const dt = ts - last;
+    // A settling pipeline shows up as huge or wildly irregular gaps; a live one is ~16ms.
+    if (!pipelineSince) pipelineSince = ts;
+    if (last > 0 && dt < 60) goodFrames++; else goodFrames = 0;
+    L.pipelineReady = goodFrames >= PIPELINE_FRAMES || (ts - pipelineSince) > PIPELINE_GIVEUP;
     last = ts;
     const now = Date.now();
     const t0 = performance.now();
@@ -219,7 +260,32 @@
         L.gpuLoad = Math.round(g / 4) * 4;
       }
     }
+    // Busy frames (key null: morphs, ripples, the visualiser, the boot) run every vsync; an
+    // unchanged picture sleeps until it next changes by itself.
+    // (A boot or resume still settling is busy by construction — splash or a held morph — so
+    // the pipeline check needs no special case here.)
+    if (L.lastKey === null) kick();
+    else sleepFor(L.nextWakeMs(now));
   }
+
+  // Any assignment of lastKey = null anywhere in the launcher means "redraw", so make it wake
+  // the loop. That covers every internal timer and state change without hunting them down.
+  let lastKeyV = L.lastKey;
+  Object.defineProperty(L, 'lastKey', {
+    configurable: true,
+    get() { return lastKeyV; },
+    set(v) { lastKeyV = v; if (v === null) kick(); }
+  });
+  // Every call from Android is an event that may change the picture.
+  Object.keys(window.ZL).forEach((k) => {
+    const fn = window.ZL[k];
+    window.ZL[k] = function () { const r = fn.apply(this, arguments); kick(); return r; };
+  });
+  // And so is every touch or key, before its own handler even runs.
+  ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove', 'keydown'].forEach((e) =>
+    window.addEventListener(e, kick, { passive: true, capture: true }));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) kick(); });
+
   tickStart();
   // Startup marker: logcat -s ZrnWeb answers "which build's JS is actually live" in one line.
   console.log('ZrnDotMatrix ' + bridge.version() + ' ui up, renderer=' + R.kind +

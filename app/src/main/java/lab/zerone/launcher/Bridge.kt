@@ -153,7 +153,7 @@ class Bridge(private val act: MainActivity) {
         runTermux("rigelwrite", write)
 
         // Give the write a beat to land before the session opens and reads the file.
-        act.web.postDelayed({
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             runTermuxVisible("bash \$HOME/.rigel/bootstrap.sh $safeBackend")
         }, 700)
         return true
@@ -281,7 +281,7 @@ class Bridge(private val act: MainActivity) {
         runTermux("daemonsync", "test -f \$HOME/.rigel/bin/rigel-daemon.js && node \$HOME/.rigel/bin/rigel-daemon.js >/dev/null 2>&1 &")
     }
 
-    @JavascriptInterface fun haptic() = act.runOnUiThread { act.web.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS) }
+    @JavascriptInterface fun haptic() = act.runOnUiThread { act.haptics.tick(1.0f) }
 
     @JavascriptInterface fun isPreciseHaptics(): Boolean = act.haptics.isPreciseHapticsSupported
     @JavascriptInterface fun hapticRipple() = act.haptics.ripple()
@@ -398,6 +398,48 @@ class Bridge(private val act: MainActivity) {
 
     /** The UI turns the accelerometer on only while the RIGEL screen is showing. */
     @JavascriptInterface fun setTiltWanted(v: Boolean) = act.runOnUiThread { act.tiltWanted = v }
+
+    /**
+     * Where the under-display fingerprint sensor sits, as fractions of the screen:
+     * {x, y, r, found}. The boot animation can then pour the home screen out of the sensor.
+     *
+     * There is no public API for this. SystemUI draws its own fingerprint overlay from the
+     * framework resource `config_udfps_sensor_props` (x, y, radius in pixels), so that is what
+     * this reads — every device with an under-display sensor fills it in, and a device without
+     * one leaves it empty. When it is missing the caller gets the Pixel 7's position, flagged
+     * as not-found so the UI can say so and let the user place it by hand.
+     */
+    @JavascriptInterface
+    fun fingerprintSensor(): String {
+        val metrics = act.resources.displayMetrics
+        val w = metrics.widthPixels.toFloat().coerceAtLeast(1f)
+        val h = metrics.heightPixels.toFloat().coerceAtLeast(1f)
+        var x = -1f; var y = -1f; var rad = -1f
+        try {
+            val res = android.content.res.Resources.getSystem()
+            for (name in listOf("config_udfps_sensor_props", "config_udfpsSensorProps")) {
+                val id = res.getIdentifier(name, "array", "android")
+                if (id == 0) continue
+                val arr = try { res.getIntArray(id) } catch (e: Throwable) { continue }
+                if (arr.size >= 3 && arr[2] > 0) { x = arr[0].toFloat(); y = arr[1].toFloat(); rad = arr[2].toFloat(); break }
+            }
+        } catch (e: Throwable) {}
+
+        val found = x >= 0 && y >= 0 && rad > 0
+        val o = JSONObject()
+        if (found) {
+            o.put("x", x / w).put("y", y / h).put("r", rad / w)
+        } else {
+            // Pixel 7: centred, a touch under 89% of the way down, radius ~9.5% of the width.
+            o.put("x", 0.5).put("y", 0.885).put("r", 0.095)
+        }
+        return o.put("found", found)
+            .put("hasSensor", pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT))
+            .toString()
+    }
+
+    /** The boot's first frame is on the panel: drop the black cover raised at screen-off. */
+    @JavascriptInterface fun uiReady() = act.onUiReady()
 
     /** Kept separate from tilt: a shake-triggered scene needs the sensor on any screen. */
     @JavascriptInterface fun setShakeWanted(v: Boolean) = act.runOnUiThread { act.shakeWanted = v }

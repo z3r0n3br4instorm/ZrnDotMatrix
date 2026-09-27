@@ -202,6 +202,8 @@ class Launcher {
     this.bootHaptic = false; this.sweepHaptic = false;   // boot patterns fire once each
     this.bootPending = true;                             // rebase t0 onto the first drawn frame
     this.resumePending = false;                          // ditto for the return-from-app morph
+    this.pipelineReady = false;                          // raised by app.js once frames land
+    this.uiShown = false; this.uiAsked = false; this.uiAskedAt = 0;   // cover handshake for the boot
     this.pausedAt = 0;                                   // when another app last took the screen
     this.hist = []; this.job = null; this.apps = []; this.drawerTop = 0;
     this.appsLoaded = false;                             // native is reading app labels right now
@@ -271,6 +273,9 @@ class Launcher {
     this.bootHaptic = false;
     this.sweepHaptic = false;
     this.bootPending = true;
+    this.uiShown = false; this.uiAsked = false;
+    this.resumePending = false;                          // the boot replay supersedes it
+    this.pausedAt = 0;
     if (this.fireTrigger) this.fireTrigger('unlock', '');
     this.midKindNow = null;                              // the wordmark flies in with the rest
   }
@@ -571,7 +576,7 @@ class Launcher {
    * from the last frame we drew — the OPENING screen — into the home layout, so the
    * return reads as the launch animation running backwards.
    */
-  resumeHome() {
+  resumeHome(wakeOwed) {
     // Only an actual app launch rewinds to home. Quick-settings panels and the RIGEL
     // setup session also leave the launcher, but coming back should return you to the
     // screen you left, with its state refreshed.
@@ -585,6 +590,16 @@ class Launcher {
     // a notification, or the task switcher. Keyed on how long we were actually away, because
     // launchedAway only ever knew about launches the launcher started itself, which is why
     // coming back through quick switch arrived with no animation at all.
+    // Behind a keyguard there is nothing to return *to* yet: the screen came on under the
+    // lock screen and a boot replay fires the instant the user is through. Arming the closing
+    // morph here is what made an unlock from the lock screen play a pointless home-to-home
+    // dot swap first and the real boot animation second. From AOD the two landed on the same
+    // frame so the morph was never seen, which is why only this path showed it.
+    if (wakeOwed) {
+      this.launchedAway = false;
+      this.lastKey = null;
+      return;
+    }
     const away = this.pausedAt ? Date.now() - this.pausedAt : 0;
     if (this.launchedAway || away > 400) {
       this.launchedAway = false;
@@ -704,6 +719,122 @@ class Launcher {
     this.resetArmed = 0;
     this.midKindNow = null;
     this.go('home');
+  }
+
+
+  // ---------------- boot seed ----------------
+  /**
+   * Where the home screen's dots fly in from. 'random' scatters them over the whole panel;
+   * 'fp' packs them into a filled circle covering the fingerprint sensor, so the launcher
+   * looks like it is poured out of the reader you just touched.
+   */
+  fpCircle(s) {
+    const cfg = this.config.fp || {};
+    const nat = this.fpNative || { x: 0.5, y: 0.885, r: 0.095 };
+    const fx = cfg.x !== undefined ? cfg.x : nat.x;
+    const fy = cfg.y !== undefined ? cfg.y : nat.y;
+    const fr = cfg.r !== undefined ? cfg.r : nat.r;
+    return { x: fx * s.w, y: fy * s.h, r: Math.max(s.pitch * 2, fr * s.w) };
+  }
+
+  /** Reads the sensor position from Android once, and remembers whether it was detected. */
+  loadFingerprint() {
+    if (this.fpNative) return this.fpNative;
+    const fp = this.bridge.fingerprintSensor ? this.bridge.fingerprintSensor() : null;
+    this.fpNative = fp && fp.r ? fp : { x: 0.5, y: 0.885, r: 0.095, found: false };
+    return this.fpNative;
+  }
+
+  bootSeedPoints(s, n) {
+    if ((this.config.bootSeed || 'random') !== 'fp') return scatter(s, n, 4);
+    const fp = this.fpCircle(s);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      // sqrt on the radius fills the disc evenly instead of crowding the centre.
+      const a = hash(i, 5, 23) * 6.28318;
+      const rr = Math.sqrt(hash(i, 9, 31)) * fp.r;
+      out.push({ x: fp.x + Math.cos(a) * rr, y: fp.y + Math.sin(a) * rr, v: 3 });
+    }
+    return out;
+  }
+
+  /**
+   * The position picker: an empty panel the user maps the sensor onto. First tap sets the
+   * centre, any later tap sets the radius to that distance, vertical drag fine-tunes it, and
+   * DONE sits top right.
+   */
+  drawFpMap(g, A) {
+    const s = this.s;
+    const fp = this.fpCircle(s);
+    const cc = fp.x / s.pitch - s.cOff, cr = fp.y / s.pitch, crad = fp.r / s.pitch;
+
+    // The circle being mapped, filled the way the boot animation will fill it.
+    for (let r = Math.floor(cr - crad); r <= Math.ceil(cr + crad); r++) {
+      for (let c = Math.floor(cc - crad); c <= Math.ceil(cc + crad); c++) {
+        const d = Math.hypot(c - cc, r - cr);
+        if (d <= crad) g.set(c, r, d > crad - 1.2 ? 1 : 3);
+      }
+    }
+    g.set(cc, cr, 2);
+    g.hline(cc - 2, cc + 2, cr, 2);
+    g.vline(cc, cr - 2, cr + 2, 2);
+
+    // 68 columns is about fifteen characters of this font, so every line here is short by
+    // necessity; the readout is in percentages of the panel rather than pixels, which is what
+    // the position is actually stored as.
+    g.text3('SENSOR', 5, 11, 1, 42);
+    g.text3('TAP = CENTRE', 5, 22, 3, 62);
+    g.text3('TAP 2 = EDGE', 5, 29, 3, 62);
+    g.text3('DRAG = SIZE', 5, 36, 3, 62);
+    const pct = (v) => (v * 100).toFixed(1);
+    g.text3('X' + pct(fp.x / s.w) + ' Y' + pct(fp.y / s.h), 5, 46, 3, 62);
+    g.text3('R' + pct(fp.r / s.w), 5, 53, 3, 62);
+    g.text3(this.fpSnapped ? 'CENTRED' : (this.fpNative && this.fpNative.found ? 'SYSTEM POSITION' : 'NOT DETECTED'), 5, 63, this.fpSnapped ? 2 : 3, 62);
+    // Only worth saying while the fallback is what is actually in use.
+    if (!(this.fpNative && this.fpNative.found) && !this.config.fp) g.text3('PIXEL 7 SPOT', 5, 70, 3, 62);
+
+    // DONE, top right.
+    g.frame(45, 8, 63, 20, 1);
+    g.text3c('DONE', 54, 11, 1);
+    this.hits.push([45, 8, 63, 20, () => {
+      this.config.bootSeed = 'fp';
+      this.bridge.saveConfig(this.config);
+      this.snapshot('FP MAP');
+      this.go('settings');
+    }]);
+
+    g.frame(5, this.s.rows - 16, 25, this.s.rows - 4, 3);
+    g.text3c('RESET', 15, this.s.rows - 13, 3);
+    this.hits.push([5, this.s.rows - 16, 25, this.s.rows - 4, () => {
+      this.config.fp = null;
+      this.fpStage = 0;
+      this.nudge(200);
+    }]);
+  }
+
+  /** Tap handling for the picker. Kept out of the hit list so the whole panel is mappable. */
+  fpMapTap(c, r) {
+    const s = this.s;
+    const fp = this.fpCircle(s);
+    const cc = fp.x / s.pitch - s.cOff, cr = fp.y / s.pitch;
+    const cfg = this.config.fp || {};
+    if (!this.fpStage) {
+      // First tap places the sensor centre and keeps whatever radius was in play. Fingerprint
+      // readers are almost always on the panel's centre line, and a tap is a blunt instrument,
+      // so anything within a few percent of the middle snaps to exactly the middle.
+      let nx = (c + s.cOff) * s.pitch / s.w;
+      const snapped = Math.abs(nx - 0.5) < 0.045;
+      if (snapped) nx = 0.5;
+      this.config.fp = { x: nx, y: r * s.pitch / s.h, r: cfg.r !== undefined ? cfg.r : this.loadFingerprint().r };
+      this.fpSnapped = snapped;
+      this.fpStage = 1;
+    } else {
+      // Later taps set the radius to the distance from the centre.
+      const d = Math.hypot(c - cc, r - cr) * s.pitch;
+      this.config.fp = { x: cfg.x !== undefined ? cfg.x : fp.x / s.w, y: cfg.y !== undefined ? cfg.y : fp.y / s.h, r: Math.max(s.pitch * 2, d) / s.w };
+    }
+    if (this.config.haptics && this.bridge.hapticTick) this.bridge.hapticTick(0.35);
+    this.lastKey = null;
   }
 
   // ---------------- status & events ----------------
@@ -870,13 +1001,35 @@ class Launcher {
     // The clock only starts when there is actually a frame on the panel. Between a wake and
     // the first draw there can be seconds of lock screen (or WebView startup), and timing the
     // boot from the wake itself meant the flight and both its haptics were spent unseen.
-    if (this.bootPending) { this.bootPending = false; this.t0 = A; }
+    // Coming out of deep sleep the WebView will happily run frames for a few hundred ms
+    // before the compositor puts anything on the panel: the animation burned through behind
+    // a black screen and you saw it resume halfway. So while the pipeline is still settling,
+    // hold at frame zero — t0 keeps moving with A, so the flight has not started yet — and
+    // only commit (and fire the haptic) once frames are actually landing at a steady cadence.
+    // Boot: draw frame 0 (the seed — fingerprint disc or scatter) straight away, report it,
+    // and hold the clock there until native says that frame is actually on the panel and the
+    // black cover is gone. Only then does the flight (and its haptic) start. After a deep sleep
+    // this is what keeps the animation from running behind a black screen; in the normal case
+    // the round trip is a frame or two.
+    if (this.bootPending) {
+      this.t0 = A;
+      if (!this.uiAsked) {
+        this.uiAsked = true;
+        this.uiAskedAt = A;
+        if (this.bridge.uiReady) this.bridge.uiReady(); else this.uiShown = true;
+      }
+      // Never hold longer than this, whatever native says.
+      if (this.uiShown || A - this.uiAskedAt > 900) this.bootPending = false;
+    }
     // Same reasoning for the return-from-app morph: start it, and its haptic, on the frame
     // that actually reaches the panel.
-    if (this.resumePending) {
+    if (this.resumePending && this.pipelineReady) {
       this.resumePending = false;
       this.switchAt = A;
+      if (this.bridge.uiReady) this.bridge.uiReady();
       if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+    } else if (this.resumePending) {
+      this.switchAt = A;                                   // hold the morph at its first frame
     }
     const t = A - this.t0;
     const arranging = this.screen === 'splash' || t < BOOT_ARRANGE_MS;
@@ -916,7 +1069,7 @@ class Launcher {
       if (this.screen === 'splash') this.screen = 'home';
       // The whole flight is felt, not just its first frame: a rise while the field is loose,
       // ticks packing tighter as it converges, one click as it lands.
-      if (!this.bootHaptic) {
+      if (!this.bootHaptic && !this.bootPending) {
         this.bootHaptic = true;
         if (this.config.haptics) {
           if (this.bridge.hapticArrange) this.bridge.hapticArrange(BOOT_ARRANGE_MS);
@@ -925,7 +1078,7 @@ class Launcher {
       }
       const home = this.compose('home', A).cells();
       const u = Math.min(1, t / BOOT_ARRANGE_MS);
-      all = morph(scatter(s, home.length, 4), home, u, 1);
+      all = morph(this.bootSeedPoints(s, home.length), home, u, 1);
       ghostOp = amoled ? 0 : 0.02 + 0.07 * u;
       bloomOp = 0.35 + 0.35 * u;
       this.hits = [];                                    // nothing is tappable mid-flight
@@ -967,16 +1120,38 @@ class Launcher {
     return [];
   }
 
+  /**
+   * How long the frame loop may sleep before the picture changes on its own. It probes the
+   * redraw key forward in time instead of restating its rules, so it can never disagree with
+   * keyFor about what counts as a change. Events wake the loop early regardless; the 1s cap
+   * just means an idle screen re-checks itself once a second.
+   */
+  nextWakeMs(A) {
+    if (this.sceneActiveList && this.sceneActiveList.length) return 16;   // keyFor mutates the run list
+    const k0 = this.keyFor(A);
+    if (k0 === null) return 16;
+    for (let dt = 20; dt <= 1000; dt += 20) {
+      if (this.keyFor(A + dt) !== k0) return dt;
+    }
+    return 1000;
+  }
+
   keyFor(A) {
     const d = new Date(A), st = this.status, w = this.weather;
     const k = [this.screen, this.palName, d.getHours(), d.getMinutes()];
     if (this.sceneBusy && this.sceneBusy(A)) return null;   // a live scene animates every frame
     if (this.screen === 'home') {
-      k.push(d.getMilliseconds() < 500, Math.floor(A / 350) % 2, st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
+      // Only phases something on the home screen actually animates at. Two old terms here
+      // (A/350 and A/230) matched nothing drawn and forced ~7 redraws a second of an unchanged
+      // picture; with the frame loop now sleeping between changes, every term is a wakeup.
+      const wxMs = w.kind ? ({ Sun: 1000, Cloud: 1000, Rain: 500 }[w.kind] || 0) : 0;
+      const rg = this.rigel && (this.rigel.activeMini || this.rigel.state === 'listening');
+      k.push(d.getMilliseconds() < 500, wxMs ? Math.floor(A / wxMs) % 2 : 0, rg ? Math.floor(A / 60) : 0,
+        st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
         st.wifi, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
-        st.cpu, st.ram, this.gpuLoad, Math.floor(A / 230) % 4, !!this.activeEvent, this.eventQueue.length,
+        st.cpu, st.ram, this.gpuLoad, !!this.activeEvent, this.eventQueue.length,
         this.battWarn() && A % 1000 < 620,               // low-battery blink phase
-        Math.floor(A / 530) % 2,                         // dock terminal cursor blink
+        Math.floor(A / 500) % 2,                         // dock cursor, phase-locked to the colon
         this.appCaching(A) ? Math.floor(A / 70) % 12 : 0,     // app-cache throbber
         (this.status.notif && this.status.notif.length) ? Math.floor(A / 420) % 2 : 0,
         this.status.notif ? this.status.notif.length : 0);
@@ -990,6 +1165,7 @@ class Launcher {
       k.push(st.wifi, st.bt, st.data, st.loc, Math.floor(A / 160) % 3, Math.floor(A / 260) % 4, A % 900 < 520);
     }
     else if (this.screen === 'guide') k.push(this.guidePage);
+    else if (this.screen === 'fpmap') k.push(JSON.stringify(this.config.fp || {}), this.fpStage || 0, !!this.fpSnapped);
     else if (this.screen === 'rigel') return null;        // parallax + sweep animate every frame
     else if (this.screen === 'rigelsetup') {
       if (this.rigel.installing) return null;          // progress bar animates every frame
@@ -1018,6 +1194,7 @@ class Launcher {
     else if (screen === 'guide') this.drawGuide(g, A);
     else if (screen === 'rigel') this.drawRigel(g, A);
     else if (screen === 'rigelsetup') this.drawRigelSetup(g, A);
+    else if (screen === 'fpmap') this.drawFpMap(g, A);
     return g;
   }
 
@@ -1029,7 +1206,8 @@ class Launcher {
     const s = HI_SCREENS.indexOf(this.screen) >= 0 ? this.sHi : this.sNormal;
     const c = (x - s.ox) / s.pitch - s.cOff, r = (y - s.oy) / s.pitch;   // back to design columns
     const hit = this.hits.find((h) => c >= h[0] - 0.5 && c <= h[2] + 0.5 && r >= h[1] - 0.5 && r <= h[3] + 0.5);
-    if (hit) hit[4]();
+    if (hit) { hit[4](); return; }
+    if (this.screen === 'fpmap') this.fpMapTap(c, r);
   }
   hold(x, y) {
     const s = HI_SCREENS.indexOf(this.screen) >= 0 ? this.sHi : this.sNormal;
@@ -1099,6 +1277,17 @@ class Launcher {
     return false;
   }
   drag(dyPx) {                                          // drawer scrolling
+    if (this.screen === 'fpmap') {
+      const s = this.s, fp = this.fpCircle(s), cfg = this.config.fp || {};
+      const next = Math.max(s.pitch * 2, fp.r - dyPx);
+      this.config.fp = {
+        x: cfg.x !== undefined ? cfg.x : fp.x / s.w,
+        y: cfg.y !== undefined ? cfg.y : fp.y / s.h,
+        r: next / s.w
+      };
+      this.lastKey = null;
+      return;
+    }
     if (this.screen !== 'drawer') return;
     const rowsPer = 7, maxTop = Math.max(0, this.apps.length - this.drawerRows());
     const next = Math.max(0, Math.min(maxTop, this.drawerTop - dyPx / (this.s.pitch * rowsPer)));
@@ -1150,7 +1339,9 @@ class Launcher {
     g.text3(date, 63 - DotGrid.width3(date), 27, 3);
     const w = this.weather;
     if (w.temp !== null) {
-      const wi = { Sun: fr(700) ? ICON.sunB : ICON.sunA, Cloud: fr(1100) ? ICON.cloudB : ICON.cloudA, Rain: fr(260) ? ICON.rainB : ICON.rainA }[w.kind];
+      // Weather frames flip on the clock colon's 500ms edges, so an idle home screen has one
+      // shared heartbeat to redraw on instead of three unrelated ones.
+      const wi = { Sun: fr(1000) ? ICON.sunB : ICON.sunA, Cloud: fr(1000) ? ICON.cloudB : ICON.cloudA, Rain: fr(500) ? ICON.rainB : ICON.rainA }[w.kind];
       const ts = Math.round(w.temp) + '\u00B0C', tw = DotGrid.width3(ts);
       g.text3(ts, 63 - tw, 34, 1);
       if (wi) g.bmp(wi, 63 - tw - 9, 34, 1);
@@ -1191,6 +1382,11 @@ class Launcher {
     if (this.midKindNow !== null && kind !== this.midKindNow) {
       this.midPrevCells = this.midCells;
       this.midSwitchAt = A;
+      // The morph starts here, mid-frame — after frame() has already decided whether this
+      // frame is busy. Without this the loop saw an idle frame and slept until the next
+      // clock-colon edge (up to 500ms), so the 380ms morph ran unseen: the ZERONE logo just
+      // snapped to the widget. Marking the frame busy keeps it drawing every vsync.
+      this.lastKey = null;
       if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
     }
     this.midKindNow = kind;
@@ -1251,18 +1447,20 @@ class Launcher {
         ix = Math.round(from + (ix - from) * easeIO(Math.min(1, u)));
       }
       const notif = this.dockNotif(a);
-      // A tile with something waiting pulses between accent and normal; everything else is
-      // drawn flat. The blink is slow enough to read as "look here", not as a fault.
-      g.bmp2(ic, ix, iy, notif && fr(420) ? 2 : 1);
-      if (notif) g.set(ix + w, iy - 1, fr(420) ? 2 : 1);   // corner pip, so it reads while the icon is dim
-      // Live prompt: the terminal tile blinks its cursor on the same 530ms cadence as the
-      // Termux screen, rather than carrying a dead one baked into the bitmap.
-      if (a.id === 'term' && fr(530)) g.hline(ix + 6, ix + 9, iy + 10, 2);
+      // A tile with something waiting pulses red against its normal state. Slow enough to
+      // read as "look here" rather than as a fault, and red is the one value the palettes
+      // keep distinct from the accent, so it never blends into the dock.
+      g.bmp2(ic, ix, iy, notif && fr(420) ? 9 : 1);
+      if (notif) g.set(ix + w, iy - 1, 9);                 // corner pip, so it reads while the icon is dim
+      // Live prompt: the terminal tile blinks its cursor rather than carrying a dead one baked
+      // into the bitmap. 500ms and phase-locked to the clock colon, so the two blinks share
+      // one redraw instead of costing two.
+      if (a.id === 'term' && fr(500)) g.hline(ix + 6, ix + 9, iy + 10, 2);
       // Touch targets tile the row edge to edge regardless of glyph size, so the small
       // outer icons are no harder to hit than the big middle one.
       this.hits.push([a.hit[0], 130 + dy, a.hit[1], 144 + dy, () => this.open(a.act, a.name)]);
     });
-    if (!fr(530)) g.hline(34, 36, 140 + dy, 0);
+    if (!fr(500)) g.hline(34, 36, 140 + dy, 0);
     g.hline(4, 63, 145 + dy, 3, 2);
     g.bmp(['..X..', '.X.X.', 'X...X'], 31, 147 + dy, 3);
     // Opening the drawer must not wait on anything: show what is cached and let a background
@@ -1711,52 +1909,55 @@ class Launcher {
         this.config.scenes = this.config.scenes === false ? true : false;
         this.stopScenes();
         this.syncShakeSensor();
+      }},
+      // Where the boot dots come from. FINGERPRINT pours them out of the reader; the position
+      // is read from the system when it publishes one, and is mappable by hand either way.
+      { label: 'BOOT ORIGIN', val: (this.config.bootSeed === 'fp' ? 'FINGERPRINT' : 'RANDOM DOTS') +
+          (this.config.bootSeed === 'fp' && this.loadFingerprint().found ? ' *' : ''), toggle: () => {
+        this.config.bootSeed = this.config.bootSeed === 'fp' ? 'random' : 'fp';
+        if (this.config.bootSeed === 'fp') this.loadFingerprint();
       }}
     ];
 
-    sysRows.forEach((row, i) => this.settingsRow(g, row, 116 + i * 10));
+    sysRows.forEach((row, i) => this.settingsRow(g, row, 116 + i * 9));
 
-    g.text3('* BETA', 12, 199, 3);
-    g.hline(8, 127, 203, 3, 2);
+    g.text3('* DETECTED BY SYSTEM', 12, 206, 3);
+    g.hline(8, 127, 211, 3, 2);
 
-    // Test Audio toggle
-    const audioY = 207;
-    g.frame(16, audioY, 120, audioY + 12, 3);
-    g.text3c(this.status.playing ? 'STOP DEMO AUDIO' : 'TEST DEMO AUDIO', 67.5, audioY + 4, 1);
-    this.hits.push([16, audioY, 120, audioY + 12, () => {
+    // Utilities, two to a line — the sheet does not scroll, so the rows it spends have to earn
+    // their space and these four are all one-shot actions.
+    const btn = (c0, c1, y, label, tint, act) => {
+      g.frame(c0, y, c1, y + 12, tint === undefined ? 3 : tint);
+      g.text3c(label, (c0 + c1) / 2, y + 4, tint === 9 ? 9 : 1);
+      this.hits.push([c0, y, c1, y + 12, act]);
+    };
+
+    const rowA = 215;
+    btn(16, 66, rowA, this.status.playing ? 'STOP DEMO' : 'TEST AUDIO', 3, () => {
       this.toggleDemoPlay();
       this.go('home');
-    }]);
+    });
+    btn(70, 120, rowA, 'HOW TO USE', 3, () => this.go('guide'));
 
-    // Guide
-    const guideY = 222;
-    g.frame(16, guideY, 120, guideY + 12, 3);
-    g.text3c('HOW TO USE THIS LAUNCHER', 67.5, guideY + 4, 1);
-    this.hits.push([16, guideY, 120, guideY + 12, () => this.go('guide')]);
+    const rowB = 231;
+    btn(16, 66, rowB, 'TEST BANNERS', 3, () => this.testEvents());
+    btn(70, 120, rowB, 'MEDIA ACCESS', 3, () => this.bridge.openNotificationAccess());
 
-    // Test Event button
-    const testY = 237;
-    g.frame(16, testY, 120, testY + 12, 3);
-    g.text3c('TEST EVENT BANNERS', 67.5, testY + 4, 1);
-    this.hits.push([16, testY, 120, testY + 12, () => {
-      this.testEvents();
-    }]);
-
-    // Media permissions button
-    const permY = 252;
-    g.frame(16, permY, 120, permY + 12, 3);
-    g.text3c('GRANT MEDIA + AUDIO ACCESS', 67.5, permY + 4, 1);
-    this.hits.push([16, permY, 120, permY + 12, () => {
-      this.bridge.openNotificationAccess();
-    }]);
+    // Fingerprint position picker.
+    const fpY = 247;
+    const fpNat = this.loadFingerprint();
+    btn(16, 120, fpY, this.config.fp ? 'SENSOR: CUSTOM (EDIT)' :
+      (fpNat.found ? 'MAP SENSOR POSITION' : 'MAP SENSOR (UNDETECTED)'), 3, () => {
+      this.fpStage = 0;
+      this.go('fpmap');
+    });
 
     // Recovery: step back through recorded states, or drop the lot.
-    const recY = 267;
+    const recY = 263;
     const snap = this.restoreTarget();
     const tl = this.loadTimeline();
-    g.frame(16, recY, 66, recY + 12, 3);
-    g.text3c(snap ? 'UNDO: ' + snap.label + ' ' + this.snapAge(snap) : 'NO HISTORY YET', 41, recY + 4, snap ? 1 : 3);
-    this.hits.push([16, recY, 66, recY + 12, () => {
+    const armed = this.restoreArmed === (this.restoreIx || 0) && !!snap;
+    btn(16, 66, recY, snap ? (armed ? 'TAP AGAIN TO APPLY' : 'UNDO: ' + snap.label + ' ' + this.snapAge(snap)) : 'NO HISTORY YET', snap ? 3 : 3, () => {
       if (!tl.length) return;
       // First tap picks the state, a second tap on the same one applies it — so a mis-tap
       // cannot silently roll your launcher back.
@@ -1768,27 +1969,21 @@ class Launcher {
       }
       this.restoreArmed = this.restoreIx || 0;
       this.nudge(200);
-    }]);
-    g.text3c(this.restoreArmed === (this.restoreIx || 0) && snap ? 'TAP AGAIN TO APPLY' : (tl.length > 1 ? 'HOLD-FREE: NEXT >' : ''), 41, recY + 15, 3);
-    // Step to an older snapshot.
-    g.frame(70, recY, 96, recY + 12, 3);
-    g.text3c('OLDER', 83, recY + 4, tl.length > 1 ? 1 : 3);
-    this.hits.push([70, recY, 96, recY + 12, () => {
+    });
+    btn(70, 96, recY, 'OLDER', 3, () => {
       if (tl.length < 2) return;
       this.restoreIx = ((this.restoreIx || 0) + 1) % tl.length;
       this.restoreArmed = -1;
       this.nudge(200);
-    }]);
-    g.frame(100, recY, 120, recY + 12, this.resetArmed ? 9 : 3);
-    g.text3c(this.resetArmed ? 'SURE?' : 'RESET', 110, recY + 4, this.resetArmed ? 9 : 1);
-    this.hits.push([100, recY, 120, recY + 12, () => {
+    });
+    btn(100, 120, recY, this.resetArmed ? 'SURE?' : 'RESET', this.resetArmed ? 9 : 3, () => {
       if (this.resetArmed && Date.now() - this.resetArmed < 6000) { this.factoryReset(); return; }
       this.resetArmed = Date.now();
       this.nudge(200);
-    }]);
+    });
 
     // Done button
-    const doneY = 285;
+    const doneY = 281;
     g.frame(26, doneY, 110, doneY + 14, 1);
     g.text3c('DONE (RETURN HOME)', 67.5, doneY + 5, 1);
     this.hits.push([26, doneY, 110, doneY + 14, () => {
