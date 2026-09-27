@@ -26,7 +26,7 @@
     toggleRadio: (w) => (N && N.toggleRadio ? N.toggleRadio(w) : false),
     tiltAvailable: () => (N && N.tiltAvailable ? N.tiltAvailable() : false),
     setTiltWanted: (v) => { if (N && N.setTiltWanted) N.setTiltWanted(v); },
-    version: () => (N && N.version ? N.version() : 'v0.1.2'),
+    version: () => (N && N.version ? N.version() : 'v0.2.1.dev.1'),
     rigelExec: (id, cmd) => { if (N && N.rigelExec) N.rigelExec(id, cmd); },
     rigelAsk: (id, b64) => { if (N && N.rigelAsk) N.rigelAsk(id, b64); },
     rigelReady: (id) => { if (N && N.rigelReady) N.rigelReady(id); },
@@ -35,6 +35,7 @@
     rigelSetModel: (id, m) => { if (N && N.rigelSetModel) N.rigelSetModel(id, m); },
     rigelAbort: () => { if (N && N.rigelAbort) N.rigelAbort(); },
     mediaGlyphs: (id) => { if (N && N.mediaGlyphs) N.mediaGlyphs(id); },
+    customGlyphs: (id) => { if (N && N.customGlyphs) N.customGlyphs(id); },
     rigelSetup: (b) => (N && N.rigelSetup ? N.rigelSetup(b) : false),
     rigelInstall: (id, b) => { if (N && N.rigelInstall) N.rigelInstall(id, b); },
     rigelAgySetup: () => (N && N.rigelAgySetup ? N.rigelAgySetup() : false),
@@ -86,7 +87,7 @@
     onTermux(id, out, err, code, e) { L.onTermux(id, out, err, code, e); },
     wake() { L.splash(); tickStart(); },                    // screen turned on
     pause() { tickStop(); },                                // activity backgrounded
-    resume() { tickStart(); L.resumeHome(); },              // back on top: replay the closing morph
+    resume() { tickStart(); L.resumeHome(); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); },              // back on top: replay the closing morph
     home() { L.home(); },                                   // home pressed while already home
     settings() { L.openSettings(); },                       // open hidden settings
     back() { return L.back(); },

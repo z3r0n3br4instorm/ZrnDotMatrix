@@ -160,7 +160,7 @@ class Bridge(private val act: MainActivity) {
         if (pm.getLaunchIntentForPackage("com.termux") == null) {
             act.js("ZL.rigelSetupFailed(${JSONObject.quote("TERMUX NOT INSTALLED")})"); return false
         }
-        if (act.checkSelfPermission(MainActivity.TERMUX_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(act, MainActivity.TERMUX_PERMISSION) != PackageManager.PERMISSION_GRANTED) {
             act.js("ZL.rigelSetupFailed(${JSONObject.quote("ALLOW RUN_COMMAND PERMISSION")})"); return false
         }
         val i = Intent().setClassName("com.termux", "com.termux.app.RunCommandService")
@@ -188,7 +188,7 @@ class Bridge(private val act: MainActivity) {
     fun runTermux(id: String, cmd: String) {
         fun fail(msg: String) = act.js("ZL.onTermux(${JSONObject.quote(id)},'','',1,${JSONObject.quote(msg)})")
         if (pm.getLaunchIntentForPackage("com.termux") == null) return fail("TERMUX NOT INSTALLED")
-        if (act.checkSelfPermission(MainActivity.TERMUX_PERMISSION) != PackageManager.PERMISSION_GRANTED)
+        if (androidx.core.content.ContextCompat.checkSelfPermission(act, MainActivity.TERMUX_PERMISSION) != PackageManager.PERMISSION_GRANTED)
             return fail("ALLOW RUN_COMMAND PERMISSION")
         val result = Intent(act, TermuxResultReceiver::class.java).putExtra("id", id)
         // FLAG_MUTABLE only exists from API 31; below that the PendingIntent is mutable anyway.
@@ -218,7 +218,7 @@ class Bridge(private val act: MainActivity) {
         }
         "v" + ver
     } catch (_: Exception) {
-        "v0.1.2"
+        "v0.2.0"
     }
 
     /** Page finished loading: push status and location once. */
@@ -352,6 +352,7 @@ class Bridge(private val act: MainActivity) {
         val files = listOf(
             "rigel-run.sh" to listOf("\$HOME/.rigel/bin/rigel-run"),
             "rigel-install.sh" to listOf("\$HOME/.rigel/bin/rigel-install"),
+            "rigel-add-glyph.sh" to listOf("\$HOME/.rigel/bin/rigel-add-glyph"),
             "rigel-daemon.js" to listOf("\$HOME/.rigel/bin/rigel-daemon.js"),
             "AGENTS.md" to listOf("\$HOME/AGENTS.md", "\$HOME/.gemini/config/AGENTS.md"),
             "skills/natural-response/SKILL.md" to listOf("\$HOME/.gemini/config/skills/natural-response/SKILL.md", "\$HOME/.agents/skills/natural-response/SKILL.md"),
@@ -406,6 +407,13 @@ class Bridge(private val act: MainActivity) {
         runTermux(id, cmd)
     }
 
+    /** Load custom glyph definitions from Termux */
+    @JavascriptInterface
+    fun customGlyphs(id: String) {
+        val cmd = "cat \$HOME/.rigel/custom_glyphs.json 2>/dev/null || echo '{}'"
+        runTermux(id, cmd)
+    }
+
     /** Reset RIGEL session so user can start a fresh conversation */
     @JavascriptInterface
     fun rigelReset(id: String) {
@@ -441,7 +449,7 @@ class Bridge(private val act: MainActivity) {
     fun voiceCaps(): String = JSONObject()
         .put("recognition", act.voice.recognitionAvailable)
         .put("onDevice", act.voice.onDeviceAvailable)
-        .put("mic", act.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
+        .put("mic", androidx.core.content.ContextCompat.checkSelfPermission(act, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED)
         .toString()
 
     /**
@@ -452,7 +460,7 @@ class Bridge(private val act: MainActivity) {
      */
     @JavascriptInterface
     fun voiceStart(): Boolean {
-        if (act.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(act, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             act.runOnUiThread { act.requestAudioPermission() }
             return false
         }
@@ -469,7 +477,7 @@ class Bridge(private val act: MainActivity) {
 
     companion object {
         fun location(ctx: Context): Pair<Double, Double>? {
-            if (ctx.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return null
+            if (androidx.core.content.ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return null
             val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
             return try {
                 listOf(LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER, LocationManager.GPS_PROVIDER)

@@ -34,7 +34,9 @@ object Radios {
         ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
 
     private fun bt(ctx: Context): BluetoothAdapter? = try {
-        ctx.getSystemService(BluetoothManager::class.java)?.adapter
+        (androidx.core.content.ContextCompat.getSystemService(ctx, BluetoothManager::class.java)
+            ?: (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager))?.adapter
+            ?: BluetoothAdapter.getDefaultAdapter()
     } catch (_: Throwable) { null }
 
     fun wifiCapability(): String = if (Build.VERSION.SDK_INT < 29) DIRECT else PANEL
@@ -54,7 +56,8 @@ object Radios {
 
     /** Mobile data *reachable* — the enabled flag itself is not readable without a system permission. */
     fun isDataOn(ctx: Context): Boolean = try {
-        val cm = ctx.getSystemService(ConnectivityManager::class.java)
+        val cm = androidx.core.content.ContextCompat.getSystemService(ctx, ConnectivityManager::class.java)
+            ?: (ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager)
         val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
         caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) == true
     } catch (_: Throwable) { false }

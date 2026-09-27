@@ -31,6 +31,11 @@ const HI_SCREENS = ['settings', 'rigelsetup'];   // drawn on the 2x dot grid
 const MAX_RIPPLES = 9;
 const MID_L = 6;
 const MID_R = 61;
+// Boot: the home screen assembles out of scattered dots in BOOT_ARRANGE_MS and is live from
+// then on. The ZERONE wordmark rides in the middle widget for BOOT_BRAND_MS and then morphs
+// away like any other widget change, so branding never holds the whole screen hostage.
+const BOOT_ARRANGE_MS = 700;
+const BOOT_BRAND_MS = 1700;
 // RIGEL's execution backend: Antigravity CLI on Termux by default.
 const AGENTIC_BACKENDS = [
   { id: 'agy', label: 'ANTIGRAVITY' },
@@ -181,7 +186,7 @@ class Launcher {
     this.screen = 'splash'; this.t0 = Date.now();
     this.ripples = []; this.hits = []; this.lastCells = []; this.prevCells = []; this.switchAt = 0;
     this.morphMs = 450;                                  // length of the current dot-flight transition
-    this.splashMorph1 = false; this.splashMorph2 = false;
+    this.bootHaptic = false;                             // one tick when the dots start arranging
     this.hist = []; this.job = null; this.apps = []; this.drawerTop = 0;
     this.palName = 'Mono';
     this.status = { batt: 100, charging: false, wifi: false, data: false, ssid: '', bt: false, btAudio: false, audio: false, playing: false, track: '', artist: '', signal: 3, alarm: '', cpu: 20, ram: 50 };
@@ -239,13 +244,14 @@ class Launcher {
     this.morphMs = ms || 260;
     this.lastKey = null;
   }
+  /** Replay the boot sequence: dots re-arrange into home, wordmark greets from the middle slot. */
   splash() {
     this.screen = 'splash';
     this.t0 = Date.now();
     this.ripples = [];
     this.lastKey = null;
-    this.splashMorph1 = false;
-    this.splashMorph2 = false;
+    this.bootHaptic = false;
+    this.midKindNow = null;                              // the wordmark flies in with the rest
   }
 
   getApps() {
@@ -698,11 +704,13 @@ class Launcher {
     const s = HI_SCREENS.indexOf(this.screen) >= 0 ? this.sHi : this.sNormal;
     this.s = s;
     const t = A - this.t0;
-    const splashing = this.screen === 'splash' || t < 2700;
+    const arranging = this.screen === 'splash' || t < BOOT_ARRANGE_MS;
     const switching = A - this.switchAt < this.morphMs;
     const midSwitching = (this.screen === 'home') && (A - this.midSwitchAt < 380);
     const live = this.ripples.filter((q) => A - q.t < 1300);
-    const busy = splashing || switching || midSwitching || live.length || !!this.activeEvent ||
+    // t < BOOT_BRAND_MS keeps frames coming through the wordmark's sweep and, crucially,
+    // through the frame where midKind flips off 'boot' and starts the morph out of it.
+    const busy = arranging || t < BOOT_BRAND_MS || switching || midSwitching || live.length || !!this.activeEvent ||
       !!this.status.playing || this.battWarn() || (this.rigel && this.rigel.busy) || (this.job && (!this.job.out || A - this.job.done < COLS * 70 * 3));
     // A ripple that has just expired leaves transient sparks in the last drawn frame. The
     // redraw key does not change when they go, so without this the stale ripple stays
@@ -720,30 +728,21 @@ class Launcher {
     const amoled = !!this.config.amoled;
     let all, ghostOp = amoled ? 0 : 0.09, bloomOp = 0.7;
     this.hits = [];
-    if (splashing) {
-      const logo = this.logo(new DotGrid(s)).cells();
-      if (t < 900) {
-        if (t >= 150 && !this.splashMorph1) {
-          this.splashMorph1 = true;
-          if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
-        }
-        all = morph(scatter(s, logo.length, 4), logo, Math.max(0, t - 150) / 750, 1);
-        ghostOp = amoled ? 0 : 0.02; bloomOp = 0.35;
+    if (arranging) {
+      // Straight from scatter into the finished home screen — no full-screen logo stop on the
+      // way. The wordmark is part of that home frame (composeMiddle draws it), so it arrives
+      // on the same dot flight as the clock and the dock.
+      if (this.screen === 'splash') this.screen = 'home';
+      if (!this.bootHaptic) {
+        this.bootHaptic = true;
+        if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
       }
-      else if (t < 1800) {
-        const sweep = -60 + (t - 900) / 900 * (s.w + 130);
-        all = logo.map((q) => ({ x: q.x, y: q.y, v: Math.abs(q.x + (q.y - s.h / 2) * 0.5 - sweep) < 22 ? 2 : q.v }));
-        ghostOp = amoled ? 0 : 0.02 + 0.03 * (t - 900) / 900;
-      } else {
-        if (!this.splashMorph2) {
-          this.splashMorph2 = true;
-          if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
-        }
-        if (this.screen === 'splash') this.screen = 'home';
-        all = morph(logo, this.compose('home', A).cells(), Math.min(1, (t - 1800) / 850), 2);
-        ghostOp = amoled ? 0 : 0.05 + 0.04 * Math.min(1, (t - 1800) / 850);
-        this.hits = [];
-      }
+      const home = this.compose('home', A).cells();
+      const u = Math.min(1, t / BOOT_ARRANGE_MS);
+      all = morph(scatter(s, home.length, 4), home, u, 1);
+      ghostOp = amoled ? 0 : 0.02 + 0.07 * u;
+      bloomOp = 0.35 + 0.35 * u;
+      this.hits = [];                                    // nothing is tappable mid-flight
     } else {
       const g = this.compose(this.screen, A);
       // Steady state — no morph, no ripple — is the overwhelmingly common frame. Hand the
@@ -828,7 +827,7 @@ class Launcher {
   // ---------------- input ----------------
   tap(x, y) {
     const A = Date.now();
-    if (A - this.t0 < 2700 && this.screen === 'splash') return;
+    if (A - this.t0 < BOOT_ARRANGE_MS) return;            // dots still in flight, no targets yet
     this.ripple(x, y);
     const s = HI_SCREENS.indexOf(this.screen) >= 0 ? this.sHi : this.sNormal;
     const c = (x - s.ox) / s.pitch - s.cOff, r = (y - s.oy) / s.pitch;   // back to design columns
@@ -912,13 +911,27 @@ class Launcher {
   drawerRows() { return Math.floor((this.s.rows - 30) / 7); }
 
   // ---------------- screens ----------------
-  logo(g) {
-    const top = Math.round(this.s.rows / 2) - 10;
-    ZERONE.forEach((Lg, i) => g.bmp(Lg, 10 + i * 8, top, 1));
+  /**
+   * Boot greeting, drawn inside the middle widget's band: ZERONE wordmark, product name and
+   * version, with a light bar sweeping across the letters — the one part of the old
+   * full-screen splash worth keeping. cy is the row the widget centres on.
+   */
+  drawBootMark(g, A, cy) {
+    const top = cy - 12;                                 // 7-row wordmark, then two text lines
+    const u = Math.min(1, (A - this.t0) / BOOT_BRAND_MS);
+    const sweep = MID_L - 8 + u * (MID_R - MID_L + 18);
+    ZERONE.forEach((Lg, i) => {
+      const c0 = 10 + i * 8;                             // 6 glyphs, 47 columns, centred on 33.5
+      for (let r = 0; r < Lg.length; r++) {
+        for (let c = 0; c < Lg[r].length; c++) {
+          if (Lg[r][c] !== 'X') continue;
+          g.set(c0 + c, top + r, Math.abs(c0 + c - sweep) < 2.5 ? 2 : 1);
+        }
+      }
+    });
     g.text3c('ZrnDotMatrix', 33.5, top + 10, 1);
-    const ver = this.bridge.version ? this.bridge.version() : 'v0.1.2';
+    const ver = this.bridge.version ? this.bridge.version() : 'v0.2.1.dev.1';
     g.text3c(ver, 33.5, top + 17, 3);
-    return g;
   }
 
   /**
@@ -1049,6 +1062,7 @@ class Launcher {
    */
   midKind(A) {
     const p = this.status.playing ? '+p' : '';
+    if (A - this.t0 < BOOT_BRAND_MS) return 'boot';       // outranks everything: it is only ~1.7s
     if (this.rigel && (this.rigel.busy || this.rigel.activeMini || this.rigel.state === 'listening')) return 'rigel' + p;
     if (this.activeEvent) return 'ev:' + this.activeEvent.type + p;
     if (!this.status.charging && this.status.batt < BATT_CRIT) return 'lowbatt' + p;
@@ -1065,7 +1079,9 @@ class Launcher {
     const n = this.s.cols * this.s.rows;
     if (!this.midBuf || this.midBuf.length !== n) this.midBuf = new Uint8Array(n);
     const g = new DotGrid(this.s, this.midBuf);
-    if (this.rigel && (this.rigel.busy || this.rigel.activeMini || this.rigel.state === 'listening')) {
+    if (A - this.t0 < BOOT_BRAND_MS) {
+      this.drawBootMark(g, A, cy);
+    } else if (this.rigel && (this.rigel.busy || this.rigel.activeMini || this.rigel.state === 'listening')) {
       const isTool = !!this.rigel.callingTool;
       const isBusy = this.rigel.busy || this.rigel.state === 'busy';
       const isListening = this.rigel.state === 'listening';

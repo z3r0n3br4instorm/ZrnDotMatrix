@@ -33,8 +33,10 @@ import java.util.Locale
 class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit) {
 
     private val main = Handler(Looper.getMainLooper())
-    private val cm = ctx.getSystemService(ConnectivityManager::class.java)!!
-    private val audio = ctx.getSystemService(AudioManager::class.java)!!
+    private val cm = (ContextCompat.getSystemService(ctx, ConnectivityManager::class.java)
+        ?: ctx.getSystemService(Context.CONNECTIVITY_SERVICE)) as ConnectivityManager
+    private val audio = (ContextCompat.getSystemService(ctx, AudioManager::class.java)
+        ?: ctx.getSystemService(Context.AUDIO_SERVICE)) as AudioManager
     private val am = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
     private var running = false
     private var wifi = false
@@ -131,7 +133,9 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
                 cm.registerNetworkCallback(req, net)
             }
         } catch (_: Exception) {}
-        audio.registerAudioDeviceCallback(audioCb, main)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            audio.registerAudioDeviceCallback(audioCb, main)
+        }
         main.post(poll)
     }
 
@@ -141,7 +145,9 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
         try { ctx.unregisterReceiver(receiver) } catch (_: Exception) {}
         try { ctx.unregisterReceiver(mediaReceiver) } catch (_: Exception) {}
         try { cm.unregisterNetworkCallback(net) } catch (_: Exception) {}
-        audio.unregisterAudioDeviceCallback(audioCb)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            try { audio.unregisterAudioDeviceCallback(audioCb) } catch (_: Exception) {}
+        }
         main.removeCallbacks(poll)
     }
 
@@ -162,17 +168,27 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
         o.put("data", onCellular)
         o.put("ssid", if (onWifi) ssid() else "")
         o.put("bt", try {
-            ctx.getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
+            val bm = ContextCompat.getSystemService(ctx, BluetoothManager::class.java)
+                ?: (ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)
+            bm?.adapter?.isEnabled ?: BluetoothAdapter.getDefaultAdapter()?.isEnabled ?: false
         } catch (_: SecurityException) { false })
-        val outs = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        val phones = mutableSetOf(AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET,
-            AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_USB_HEADSET)
-        if (Build.VERSION.SDK_INT >= 31) phones += AudioDeviceInfo.TYPE_BLE_HEADSET
-        o.put("audio", outs.any { it.type in phones })
+
+        val hasHeadphones = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val outs = audio.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val phones = mutableSetOf(AudioDeviceInfo.TYPE_WIRED_HEADPHONES, AudioDeviceInfo.TYPE_WIRED_HEADSET,
+                AudioDeviceInfo.TYPE_BLUETOOTH_A2DP, AudioDeviceInfo.TYPE_USB_HEADSET)
+            if (Build.VERSION.SDK_INT >= 31) phones += AudioDeviceInfo.TYPE_BLE_HEADSET
+            outs.any { it.type in phones }
+        } else {
+            @Suppress("DEPRECATION")
+            audio.isWiredHeadsetOn || audio.isBluetoothA2dpOn
+        }
+        o.put("audio", hasHeadphones)
         o.put("btAudio", btRouted())
         o.put("loc", Radios.isLocOn(ctx))      // drives the quick-settings grid
         o.put("signal", signal())
-        o.put("alarm", ctx.getSystemService(AlarmManager::class.java)?.nextAlarmClock?.let {
+        o.put("alarm", (ContextCompat.getSystemService(ctx, AlarmManager::class.java)
+            ?: (ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager))?.nextAlarmClock?.let {
             SimpleDateFormat("HH:mm", Locale.US).format(it.triggerTime)
         } ?: "")
 
@@ -325,7 +341,10 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
     }
 
     private fun signal(): Int = try {
-        if (Build.VERSION.SDK_INT >= 28) ctx.getSystemService(TelephonyManager::class.java)?.signalStrength?.level ?: 0 else 3
+        if (Build.VERSION.SDK_INT >= 28) {
+            (ContextCompat.getSystemService(ctx, TelephonyManager::class.java)
+                ?: (ctx.getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager))?.signalStrength?.level ?: 0
+        } else 3
     } catch (_: Exception) { 0 }
 
     private companion object {

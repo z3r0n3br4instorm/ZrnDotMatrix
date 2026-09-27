@@ -10,6 +10,7 @@ const STATUS_FILE = path.join(RIGEL_HOME, 'status');
 const CONFIG_FILE = path.join(RIGEL_HOME, 'config.json');
 const STREAM_FILE = path.join(RIGEL_HOME, 'stream');
 const MEDIA_GLYPHS_FILE = path.join(RIGEL_HOME, 'media_glyphs.json');
+const CUSTOM_GLYPHS_FILE = path.join(RIGEL_HOME, 'custom_glyphs.json');
 const PORT = 4096;
 
 function setStatus(s) {
@@ -107,6 +108,43 @@ const server = http.createServer((req, res) => {
     } catch (e) {}
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(data + '\n');
+  }
+
+  if (req.method === 'GET' && req.url === '/custom-glyphs') {
+    let data = '{}';
+    try {
+      if (fs.existsSync(CUSTOM_GLYPHS_FILE)) {
+        data = fs.readFileSync(CUSTOM_GLYPHS_FILE, 'utf8') || '{}';
+      }
+    } catch (e) {}
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(data + '\n');
+  }
+
+  if (req.method === 'POST' && req.url === '/custom-glyphs') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body);
+        let current = {};
+        if (fs.existsSync(CUSTOM_GLYPHS_FILE)) {
+          try { current = JSON.parse(fs.readFileSync(CUSTOM_GLYPHS_FILE, 'utf8') || '{}'); } catch (_) {}
+        }
+        if (parsed.name && (parsed.rows || parsed.pattern)) {
+          current[String(parsed.name).toUpperCase().trim()] = parsed.rows || parsed.pattern;
+        } else if (typeof parsed === 'object') {
+          Object.assign(current, parsed);
+        }
+        fs.writeFileSync(CUSTOM_GLYPHS_FILE, JSON.stringify(current, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ status: 'ok' }) + '\n');
+      } catch (e) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: e.message }) + '\n');
+      }
+    });
+    return;
   }
 
   if (req.method === 'GET' && req.url === '/models') {

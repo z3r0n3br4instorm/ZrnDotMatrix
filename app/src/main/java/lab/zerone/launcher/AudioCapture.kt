@@ -33,7 +33,7 @@ class AudioCapture(private val ctx: Context, private val emit: (String) -> Unit)
     private var quietFrames = 0
 
     val hasPermission: Boolean
-        get() = ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        get() = androidx.core.content.ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     /** True once a Visualizer is actually running on the output mix. */
     var live = false

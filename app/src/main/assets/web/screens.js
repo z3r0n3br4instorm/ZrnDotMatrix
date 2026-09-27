@@ -173,9 +173,53 @@ const FALLBACK_MODELS = [
   { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)' }
 ];
 
+// Dynamic custom glyphs created by Rigel or loaded from ~/.rigel/custom_glyphs.json
+const CUSTOM_GLYPHS = {};
+
+function normalizeGlyphRows(rows) {
+  if (!rows) return null;
+  let list = [];
+  if (Array.isArray(rows)) {
+    list = rows.map(r => String(r || ''));
+  } else if (typeof rows === 'string') {
+    // Can be delimited by newline, comma, slash, or pipe
+    if (rows.indexOf('\n') >= 0) list = rows.split('\n');
+    else if (rows.indexOf('/') >= 0) list = rows.split('/');
+    else if (rows.indexOf('|') >= 0) list = rows.split('|');
+    else if (rows.indexOf(',') >= 0) list = rows.split(',');
+    else list = [rows];
+  } else {
+    return null;
+  }
+  list = list.map(r => r.trim()).filter(r => r.length > 0);
+  if (!list.length) return null;
+  // Convert each row: active pixels ('X', 'x', '#', '*', '1', '@') become 'X' and others become '.'
+  return list.map(row => {
+    let out = '';
+    for (let i = 0; i < row.length; i++) {
+      const c = row[i];
+      out += (c === 'X' || c === 'x' || c === '#' || c === '*' || c === '1' || c === '@') ? 'X' : '.';
+    }
+    return out;
+  });
+}
+
+function registerCustomGlyph(name, rows) {
+  if (!name) return false;
+  const k = String(name).toUpperCase().trim().replace(/[^A-Z0-9_\-]/g, '');
+  if (!k) return false;
+  const norm = normalizeGlyphRows(rows);
+  if (!norm || !norm.length) return false;
+  CUSTOM_GLYPHS[k] = norm;
+  return true;
+}
+
 function getRigelGlyph(name) {
   if (!name) return null;
   const k = String(name).toUpperCase().trim();
+  // 1. Check custom dynamically generated or loaded glyphs
+  if (CUSTOM_GLYPHS[k]) return CUSTOM_GLYPHS[k];
+  // 2. Built-in Rigel glyph presets
   if (k === 'FLASHLIGHT' || k === 'TORCH') return RIGEL_GLYPHS.TORCH;
   if (k === 'FILE' || k === 'DOC' || k === 'NOTE') return RIGEL_GLYPHS.FILE;
   if (k === 'CHECK' || k === 'DONE' || k === 'OK') return RIGEL_GLYPHS.CHECK;
@@ -199,30 +243,42 @@ function parseRigelResponse(raw) {
   if (!raw) return { text: '', glyph: null };
   let str = String(raw).trim();
 
-  // 1. Extract [GLYPH:<name>]
+  // 1. Extract [GLYPH_DEF:<name>:<pattern>] for inline custom glyph creation
+  // Example: [GLYPH_DEF:HEART:..XX...XX..,XXXXX.XXXXX,XXXXXXXXXXX,.XXXXXXXXX...,..XXXXXXX....,...XXXXX....,....XXX......,.....X......]
   let glyph = null;
+  const defMatch = str.match(/\[GLYPH_DEF:([A-Za-z0-9_-]+):([^\]]+)\]/i);
+  if (defMatch) {
+    const defName = defMatch[1].toUpperCase();
+    const pattern = defMatch[2];
+    if (registerCustomGlyph(defName, pattern)) {
+      glyph = defName;
+    }
+    str = str.replace(/\[GLYPH_DEF:[A-Za-z0-9_-]+:[^\]]+\]/gi, '').trim();
+  }
+
+  // 2. Extract [GLYPH:<name>]
   const glyphMatch = str.match(/\[GLYPH:([A-Za-z0-9_-]+)\]/i);
   if (glyphMatch) {
     glyph = glyphMatch[1].toUpperCase();
     str = str.replace(/\[GLYPH:[A-Za-z0-9_-]+\]/gi, '').trim();
   }
 
-  // 2. Strip code fences
+  // 3. Strip code fences
   str = str.replace(/```[\s\S]*?```/g, '');
 
-  // 3. Remove inline code backticks
+  // 4. Remove inline code backticks
   str = str.replace(/`([^`]+)`/g, '$1');
 
-  // 4. Remove Markdown headers: #, ##, ###
+  // 5. Remove Markdown headers: #, ##, ###
   str = str.replace(/^#{1,6}\s+/gm, '');
 
-  // 5. Remove bold / italics
+  // 6. Remove bold / italics
   str = str.replace(/[*_]{1,3}([^*_]+)[*_]{1,3}/g, '$1');
 
-  // 6. Remove bullet lists
+  // 7. Remove bullet lists
   str = str.replace(/^[\s]*[-*+]\s+/gm, '');
 
-  // 7. Humanize Linux / Termux file paths: extract basename
+  // 8. Humanize Linux / Termux file paths: extract basename
   str = str.replace(/\/data\/data\/[a-zA-Z0-9_.]+\/files\/(?:home\/)?([a-zA-Z0-9_.-]+)/g, '$1');
   str = str.replace(/\/home\/[a-zA-Z0-9_.-]+\/([a-zA-Z0-9_.-]+)/g, '$1');
   str = str.replace(/\/(?:sdcard|storage\/emulated\/0)\/([a-zA-Z0-9_.-]+)/g, '$1');
@@ -231,7 +287,7 @@ function parseRigelResponse(raw) {
     return parts.length ? parts[parts.length - 1] : p;
   });
 
-  // 8. Collapse whitespace
+  // 9. Collapse whitespace
   str = str.replace(/\s+/g, ' ').trim();
 
   return { text: str, glyph: glyph };
@@ -940,6 +996,7 @@ function parseRigelResponse(raw) {
       }
       this.rigel.spokenIndex = 0;
       this.refreshMediaGlyphs();
+      this.refreshCustomGlyphs();
       this.rigel.askId = null;
       this.lastKey = null;
       return true;
@@ -949,6 +1006,27 @@ function parseRigelResponse(raw) {
         const rawJson = (stdout || '').trim();
         if (rawJson && (rawJson.startsWith('[') || rawJson.startsWith('{'))) {
           this.mediaGlyphs = JSON.parse(rawJson);
+        }
+      } catch (e) {}
+      this.lastKey = null;
+      return true;
+    }
+    if (id && id.indexOf('customglyphs') >= 0) {
+      try {
+        const rawJson = (stdout || '').trim();
+        if (rawJson && (rawJson.startsWith('[') || rawJson.startsWith('{'))) {
+          const parsed = JSON.parse(rawJson);
+          if (Array.isArray(parsed)) {
+            parsed.forEach(item => {
+              if (item && item.name && (item.rows || item.pattern)) {
+                registerCustomGlyph(item.name, item.rows || item.pattern);
+              }
+            });
+          } else if (typeof parsed === 'object') {
+            for (const k in parsed) {
+              registerCustomGlyph(k, parsed[k]);
+            }
+          }
         }
       } catch (e) {}
       this.lastKey = null;
@@ -1012,6 +1090,12 @@ function parseRigelResponse(raw) {
   P.refreshMediaGlyphs = function () {
     if (this.bridge && this.bridge.mediaGlyphs) {
       this.bridge.mediaGlyphs('mediaglyphs' + Date.now());
+    }
+  };
+
+  P.refreshCustomGlyphs = function () {
+    if (this.bridge && this.bridge.customGlyphs) {
+      this.bridge.customGlyphs('customglyphs' + Date.now());
     }
   };
 

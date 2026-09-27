@@ -92,7 +92,15 @@ class MainActivity : ComponentActivity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                 assets.shouldInterceptRequest(request.url)
+
+            @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+            override fun shouldInterceptRequest(view: WebView, url: String): WebResourceResponse? =
+                assets.shouldInterceptRequest(android.net.Uri.parse(url))
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest) = true
+
+            @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+            override fun shouldOverrideUrlLoading(view: WebView, url: String) = true
         }
         // The whole UI is JavaScript; without this, script errors vanish silently.
         web.webChromeClient = object : WebChromeClient() {
@@ -155,8 +163,8 @@ class MainActivity : ComponentActivity() {
     }
 
     fun requestAudioPermission() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            androidx.core.app.ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 2)
         }
     }
 
@@ -168,8 +176,8 @@ class MainActivity : ComponentActivity() {
         )
         if (Build.VERSION.SDK_INT >= 31) want += Manifest.permission.BLUETOOTH_CONNECT
         if (Build.VERSION.SDK_INT >= 33) want += Manifest.permission.POST_NOTIFICATIONS
-        val missing = want.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isNotEmpty()) requestPermissions(missing.toTypedArray(), 1)
+        val missing = want.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) androidx.core.app.ActivityCompat.requestPermissions(this, missing.toTypedArray(), 1)
 
         // Ask for notification access once. This used to fire on every start, which threw the
         // user into Settings each time they came home — unusable as a launcher. The settings
