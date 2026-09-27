@@ -5,6 +5,8 @@
   const store = { get: (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} } };
   const bridge = {
     apps: () => { try { return N ? JSON.parse(N.apps()) : [{ label: 'Chrome', pkg: 'com.android.chrome' }, { label: 'Termux', pkg: 'com.termux' }]; } catch (e) { return []; } },
+    appsReady: () => (N && N.appsReady ? N.appsReady() : true),
+    refreshApps: () => { if (N && N.refreshApps) N.refreshApps(); },
     launch: (act) => { if (N) N.launch(act); else console.log('launch', act); },
     runTermux: (id, cmd) => { if (N) N.runTermux(id, cmd); else setTimeout(() => window.ZL.onTermux(id, 'demo: ' + cmd, '', 0, ''), 400); },
     is24h: () => (N ? N.is24h() : true),
@@ -13,6 +15,8 @@
     hapticRipple: () => { if (N && N.hapticRipple) N.hapticRipple(); },
     hapticTransition: () => { if (N && N.hapticTransition) N.hapticTransition(); },
     hapticTick: (s) => { if (N && N.hapticTick) N.hapticTick(s); },
+    hapticArrange: (ms) => { if (N && N.hapticArrange) N.hapticArrange(ms); },
+    hapticSweep: (ms) => { if (N && N.hapticSweep) N.hapticSweep(ms); },
     mediaPlayPause: () => { if (N && N.mediaPlayPause) N.mediaPlayPause(); else L.toggleDemoPlay(); },
     mediaNext: () => { if (N && N.mediaNext) N.mediaNext(); },
     mediaPrev: () => { if (N && N.mediaPrev) N.mediaPrev(); },
@@ -26,6 +30,7 @@
     toggleRadio: (w) => (N && N.toggleRadio ? N.toggleRadio(w) : false),
     tiltAvailable: () => (N && N.tiltAvailable ? N.tiltAvailable() : false),
     setTiltWanted: (v) => { if (N && N.setTiltWanted) N.setTiltWanted(v); },
+    setShakeWanted: (v) => { if (N && N.setShakeWanted) N.setShakeWanted(v); },
     version: () => (N && N.version ? N.version() : 'v0.2.1.dev.1'),
     rigelExec: (id, cmd) => { if (N && N.rigelExec) N.rigelExec(id, cmd); },
     rigelAsk: (id, b64) => { if (N && N.rigelAsk) N.rigelAsk(id, b64); },
@@ -36,6 +41,9 @@
     rigelAbort: () => { if (N && N.rigelAbort) N.rigelAbort(); },
     mediaGlyphs: (id) => { if (N && N.mediaGlyphs) N.mediaGlyphs(id); },
     customGlyphs: (id) => { if (N && N.customGlyphs) N.customGlyphs(id); },
+    saveGlyph: (json) => { if (N && N.saveGlyph) N.saveGlyph(json); },
+    uiScenes: (id) => { if (N && N.uiScenes) N.uiScenes(id); },
+    saveScene: (json) => { if (N && N.saveScene) N.saveScene(json); },
     rigelSetup: (b) => (N && N.rigelSetup ? N.rigelSetup(b) : false),
     rigelInstall: (id, b) => { if (N && N.rigelInstall) N.rigelInstall(id, b); },
     rigelAgySetup: () => (N && N.rigelAgySetup ? N.rigelAgySetup() : false),
@@ -58,7 +66,11 @@
         return defaults;
       }
     },
-    saveConfig: (c) => store.set('zlConfig', JSON.stringify(c))
+    saveConfig: (c) => store.set('zlConfig', JSON.stringify(c)),
+    // Generic slot, used by the settings state timeline.
+    loadState: (k) => store.get(k),
+    saveState: (k, v) => store.set(k, v),
+    clearState: (k) => { try { localStorage.removeItem(k); } catch (e) {} }
   };
 
   // The screens are drawn against a 68x152 design grid. Pick a pitch that fits BOTH, so a
@@ -77,6 +89,8 @@
   // ---- calls from Android ----
   window.ZL = {
     onStatus(json) { L.onStatus(json); },
+    onApps(json) { L.onApps(json); },                       // app cache finished building
+    onShake(mag) { if (L.onShake) L.onShake(mag); },         // accelerometer jolt, drives scenes
     onAudio(json) { L.onAudio(json); },                     // live FFT from AudioCapture
     onTilt(x, y) { L.onTilt(x, y); },                       // accelerometer, drives RIGEL parallax
     onVoice(text, final) { L.onVoice(text, final); },
@@ -86,8 +100,8 @@
     rigelSetupFailed(why) { L.rigelSetupFailed(why); },
     onTermux(id, out, err, code, e) { L.onTermux(id, out, err, code, e); },
     wake() { L.splash(); tickStart(); },                    // screen turned on
-    pause() { tickStop(); },                                // activity backgrounded
-    resume() { tickStart(); L.resumeHome(); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); },              // back on top: replay the closing morph
+    pause() { L.pausedAt = Date.now(); tickStop(); },        // activity backgrounded
+    resume() { tickStart(); L.resumeHome(); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); if (L.refreshScenes) L.refreshScenes(); },              // back on top: replay the closing morph
     home() { L.home(); },                                   // home pressed while already home
     settings() { L.openSettings(); },                       // open hidden settings
     back() { return L.back(); },
@@ -207,5 +221,13 @@
     }
   }
   tickStart();
-  if (N) { const loc = N.location(); if (loc) { const p = loc.split(','); weather(p[0], p[1]); } N.ready(); }
+  // Startup marker: logcat -s ZrnWeb answers "which build's JS is actually live" in one line.
+  console.log('ZrnDotMatrix ' + bridge.version() + ' ui up, renderer=' + R.kind +
+    ', haptics=' + (N && N.hapticArrange ? 'arrange+sweep' : 'legacy'));
+  if (N) {
+    const loc = N.location(); if (loc) { const p = loc.split(','); weather(p[0], p[1]); }
+    N.ready();
+    L.refreshCustomGlyphs(); L.refreshMediaGlyphs(); L.refreshScenes();
+  }
+  else L.onApps(bridge.apps());                             // desktop: no native push to wait for
 })();

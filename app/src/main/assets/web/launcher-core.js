@@ -36,6 +36,19 @@ const MID_R = 61;
 // away like any other widget change, so branding never holds the whole screen hostage.
 const BOOT_ARRANGE_MS = 700;
 const BOOT_BRAND_MS = 1700;
+// The sweep runs after the dots have landed, so the two boot haptics never overlap (a second
+// vibrate() call would cut the first one off mid-pattern). LAG holds the sweep's haptic back
+// far enough to clear the arrange's landing click, which outruns the 700ms flight slightly.
+const BOOT_SWEEP_MS = BOOT_BRAND_MS - BOOT_ARRANGE_MS;
+const BOOT_SWEEP_LAG = 90;
+// How long the throbber may own the middle slot waiting for the app list. A cold build is
+// ~1s; the cap only exists so a build that never lands cannot hold the widget forever.
+const APP_CACHE_WAIT = 12000;
+// Dock intro, measured from t0: the middle tile is already there when the dots land, then one
+// ring of tiles slides out of it every DOCK_INTRO_MS. Ends inside the boot redraw window, so
+// no extra always-busy frames are needed to animate it.
+const DOCK_INTRO_AT = BOOT_ARRANGE_MS;
+const DOCK_INTRO_MS = 220;
 // RIGEL's execution backend: Antigravity CLI on Termux by default.
 const AGENTIC_BACKENDS = [
   { id: 'agy', label: 'ANTIGRAVITY' },
@@ -186,10 +199,15 @@ class Launcher {
     this.screen = 'splash'; this.t0 = Date.now();
     this.ripples = []; this.hits = []; this.lastCells = []; this.prevCells = []; this.switchAt = 0;
     this.morphMs = 450;                                  // length of the current dot-flight transition
-    this.bootHaptic = false;                             // one tick when the dots start arranging
+    this.bootHaptic = false; this.sweepHaptic = false;   // boot patterns fire once each
+    this.bootPending = true;                             // rebase t0 onto the first drawn frame
+    this.resumePending = false;                          // ditto for the return-from-app morph
+    this.pausedAt = 0;                                   // when another app last took the screen
     this.hist = []; this.job = null; this.apps = []; this.drawerTop = 0;
+    this.appsLoaded = false;                             // native is reading app labels right now
+    this.appsBuildAt = Date.now();
     this.palName = 'Mono';
-    this.status = { batt: 100, charging: false, wifi: false, data: false, ssid: '', bt: false, btAudio: false, audio: false, playing: false, track: '', artist: '', signal: 3, alarm: '', cpu: 20, ram: 50 };
+    this.status = { batt: 100, charging: false, wifi: false, data: false, ssid: '', bt: false, btAudio: false, audio: false, playing: false, track: '', artist: '', signal: 3, alarm: '', cpu: 20, ram: 50, notif: [] };
     this.weather = { kind: null, temp: null };
     this.lastKey = null;
     this.config = this.bridge.getConfig ? this.bridge.getConfig() : {
@@ -251,14 +269,40 @@ class Launcher {
     this.ripples = [];
     this.lastKey = null;
     this.bootHaptic = false;
+    this.sweepHaptic = false;
+    this.bootPending = true;
+    if (this.fireTrigger) this.fireTrigger('unlock', '');
     this.midKindNow = null;                              // the wordmark flies in with the rest
   }
 
+  /**
+   * The list arrives through onApps() once the native worker has read every app label, so this
+   * never blocks. Until it lands the dock falls back to its built-in defaults. The pull below
+   * is only a catch-up for a missed push — appsReady() is a cheap flag read, not a build.
+   */
   getApps() {
-    if (!this.apps || !this.apps.length) {
-      this.apps = (this.bridge.apps ? this.bridge.apps() : []) || [];
+    if (!this.appsLoaded && this.bridge.apps && (!this.bridge.appsReady || this.bridge.appsReady())) {
+      this.apps = this.bridge.apps() || [];
+      if (this.apps.length) this.appsLoaded = true;
     }
     return this.apps;
+  }
+
+  /** Native push: the app cache finished building (or was rebuilt after a package change). */
+  onApps(json) {
+    try {
+      const list = typeof json === 'string' ? JSON.parse(json) : json;
+      if (Array.isArray(list)) {
+        this.apps = list;
+        this.appsLoaded = list.length > 0;
+      }
+    } catch (e) {}
+    this.lastKey = null;                                 // dock labels and the drawer both move
+  }
+
+  /** Asks for a rebuild without waiting for it; the answer comes back through onApps(). */
+  refreshApps() {
+    if (this.bridge.refreshApps) this.bridge.refreshApps();
   }
 
   // --- Dock shortcuts resolution (Customizable for all 5 slots) ---
@@ -537,7 +581,12 @@ class Launcher {
       this.lastKey = null;
       return;
     }
-    if (this.launchedAway) {
+    // Anything that put another app in front of us earns the return morph — our own launch,
+    // a notification, or the task switcher. Keyed on how long we were actually away, because
+    // launchedAway only ever knew about launches the launcher started itself, which is why
+    // coming back through quick switch arrived with no animation at all.
+    const away = this.pausedAt ? Date.now() - this.pausedAt : 0;
+    if (this.launchedAway || away > 400) {
       this.launchedAway = false;
       this.launching = null;
       this.prevCells = this.cellsSnapshot();
@@ -545,9 +594,116 @@ class Launcher {
       this.switchAt = Date.now();
       this.morphMs = 520;
       this.midKindNow = null;
-      if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+      // Deliberately no haptic here: the WebView has not repainted yet, so firing it now
+      // buzzes against a black screen and the morph is already half over by first paint.
+      // Both are armed on the first drawn frame instead.
+      this.resumePending = true;
     }
     this.lastKey = null;
+  }
+
+
+  // ---------------- state timeline ----------------
+  // RIGEL can rewrite the interface, so there has to be a way back. Every change worth
+  // undoing takes a snapshot of the whole mutable surface — settings, glyphs, scenes — and
+  // settings can walk back through them or drop to factory defaults.
+  TIMELINE_KEY() { return 'zlTimeline'; }
+
+  loadTimeline() {
+    if (this.timeline) return this.timeline;
+    this.timeline = [];
+    try {
+      const raw = this.bridge.loadState ? this.bridge.loadState(this.TIMELINE_KEY()) : null;
+      const list = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(list)) this.timeline = list;
+    } catch (e) {}
+    return this.timeline;
+  }
+
+  /** Records the current state under a short label. Newest first, capped. */
+  snapshot(label) {
+    this.loadTimeline();
+    const snap = {
+      t: Date.now(),
+      label: String(label || 'CHANGE').toUpperCase().slice(0, 10),
+      config: JSON.parse(JSON.stringify(this.config)),
+      glyphs: this.snapshotGlyphs ? this.snapshotGlyphs() : {},
+      scenes: (this.scenes || []).map((sc) => ({
+        name: sc.name, trigger: sc.trigger, target: sc.target,
+        ttl: sc.ttl, body: sc.body, enabled: sc.enabled
+      }))
+    };
+    // Don't stack identical snapshots — a settings visit that changed nothing is not history.
+    const top = this.timeline[0];
+    if (top && JSON.stringify(top.config) === JSON.stringify(snap.config) &&
+        JSON.stringify(top.scenes) === JSON.stringify(snap.scenes) &&
+        JSON.stringify(top.glyphs) === JSON.stringify(snap.glyphs)) return;
+    this.timeline.unshift(snap);
+    this.timeline = this.timeline.slice(0, 10);
+    this.restoreIx = 0;
+    if (this.bridge.saveState) this.bridge.saveState(this.TIMELINE_KEY(), JSON.stringify(this.timeline));
+  }
+
+  /** Human-readable age of a snapshot, for the settings row. */
+  snapAge(snap) {
+    const s = Math.max(0, Math.round((Date.now() - snap.t) / 1000));
+    if (s < 60) return s + 'S AGO';
+    if (s < 3600) return Math.round(s / 60) + 'M AGO';
+    if (s < 86400) return Math.round(s / 3600) + 'H AGO';
+    return Math.round(s / 86400) + 'D AGO';
+  }
+
+  restoreTarget() {
+    const tl = this.loadTimeline();
+    if (!tl.length) return null;
+    const ix = Math.max(0, Math.min(tl.length - 1, this.restoreIx || 0));
+    return tl[ix];
+  }
+
+  /** Puts the launcher back into a recorded state. The current one is banked first. */
+  restoreState(snap) {
+    if (!snap) return;
+    this.snapshot('PRE-UNDO');
+    this.config = JSON.parse(JSON.stringify(snap.config));
+    if (this.bridge.saveConfig) this.bridge.saveConfig(this.config);
+    if (this.bridge.setHapticIntensity) this.bridge.setHapticIntensity(this.hapticScale());
+    if (this.restoreGlyphs) this.restoreGlyphs(snap.glyphs);
+    if (this.bridge.saveGlyph && snap.glyphs) {
+      Object.keys(snap.glyphs).forEach((k) => {
+        try { this.bridge.saveGlyph(JSON.stringify({ name: k, rows: snap.glyphs[k] })); } catch (e) {}
+      });
+    }
+    if (this.scenes) {
+      const keep = {};
+      (snap.scenes || []).forEach((sc) => { keep[sc.name] = true; });
+      this.scenes.slice().forEach((sc) => { if (!keep[sc.name]) this.removeScene(sc.name); });
+      (snap.scenes || []).forEach((sc) => this.addScene(sc, true));
+      this.stopScenes();
+    }
+    this.midKindNow = null;
+    this.nudge(420);
+    if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+  }
+
+  /** Everything RIGEL or the user ever changed, gone: config, glyphs, scenes, history. */
+  factoryReset() {
+    this.snapshot('PRE-RESET');
+    if (this.scenes) this.scenes.slice().forEach((sc) => this.removeScene(sc.name));
+    if (this.restoreGlyphs) this.restoreGlyphs({});
+    if (this.bridge.saveGlyph) this.bridge.saveGlyph(JSON.stringify({ reset: true }));
+    if (this.bridge.clearState) {
+      this.bridge.clearState('zlConfig');
+      this.bridge.clearState('zlPalette');
+    }
+    this.config = this.bridge.getConfig ? this.bridge.getConfig() : this.config;
+    if (this.bridge.saveConfig) this.bridge.saveConfig(this.config);
+    if (this.bridge.setHapticIntensity) this.bridge.setHapticIntensity(this.hapticScale());
+    this.palName = 'Mono';
+    if (this.bridge.savePalette) this.bridge.savePalette(this.palName);
+    this.stopScenes();
+    this.resetArmed = 0;
+    this.midKindNow = null;
+    this.go('home');
   }
 
   // ---------------- status & events ----------------
@@ -568,6 +724,14 @@ class Launcher {
         }
       } else {
         this.initialStatusReceived = true;
+      }
+      // Scene triggers ride on the same status stream the widgets do.
+      if (this.fireTrigger) {
+        if (s.track !== undefined && s.track !== this.status.track && s.track) {
+          this.fireTrigger('track', (s.track || '') + ' ' + (s.artist || ''));
+        }
+        if (s.charging && !this.status.charging) this.fireTrigger('charge', '');
+        if (!s.charging && this.status.charging) this.fireTrigger('unplug', '');
       }
       this.lastWifi = !!s.wifi;
       this.lastBt = !!s.bt;
@@ -703,6 +867,17 @@ class Launcher {
 
     const s = HI_SCREENS.indexOf(this.screen) >= 0 ? this.sHi : this.sNormal;
     this.s = s;
+    // The clock only starts when there is actually a frame on the panel. Between a wake and
+    // the first draw there can be seconds of lock screen (or WebView startup), and timing the
+    // boot from the wake itself meant the flight and both its haptics were spent unseen.
+    if (this.bootPending) { this.bootPending = false; this.t0 = A; }
+    // Same reasoning for the return-from-app morph: start it, and its haptic, on the frame
+    // that actually reaches the panel.
+    if (this.resumePending) {
+      this.resumePending = false;
+      this.switchAt = A;
+      if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+    }
     const t = A - this.t0;
     const arranging = this.screen === 'splash' || t < BOOT_ARRANGE_MS;
     const switching = A - this.switchAt < this.morphMs;
@@ -711,6 +886,7 @@ class Launcher {
     // t < BOOT_BRAND_MS keeps frames coming through the wordmark's sweep and, crucially,
     // through the frame where midKind flips off 'boot' and starts the morph out of it.
     const busy = arranging || t < BOOT_BRAND_MS || switching || midSwitching || live.length || !!this.activeEvent ||
+      (this.sceneBusy && this.sceneBusy(A)) ||
       !!this.status.playing || this.battWarn() || (this.rigel && this.rigel.busy) || (this.job && (!this.job.out || A - this.job.done < COLS * 70 * 3));
     // A ripple that has just expired leaves transient sparks in the last drawn frame. The
     // redraw key does not change when they go, so without this the stale ripple stays
@@ -728,14 +904,24 @@ class Launcher {
     const amoled = !!this.config.amoled;
     let all, ghostOp = amoled ? 0 : 0.09, bloomOp = 0.7;
     this.hits = [];
+    // Wordmark sweep gets its own sensation — a brush crossing the panel, not a thump.
+    if (!this.sweepHaptic && t >= BOOT_ARRANGE_MS + BOOT_SWEEP_LAG && t < BOOT_BRAND_MS) {
+      this.sweepHaptic = true;
+      if (this.config.haptics && this.bridge.hapticSweep) this.bridge.hapticSweep(BOOT_SWEEP_MS - BOOT_SWEEP_LAG);
+    }
     if (arranging) {
       // Straight from scatter into the finished home screen — no full-screen logo stop on the
       // way. The wordmark is part of that home frame (composeMiddle draws it), so it arrives
       // on the same dot flight as the clock and the dock.
       if (this.screen === 'splash') this.screen = 'home';
+      // The whole flight is felt, not just its first frame: a rise while the field is loose,
+      // ticks packing tighter as it converges, one click as it lands.
       if (!this.bootHaptic) {
         this.bootHaptic = true;
-        if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+        if (this.config.haptics) {
+          if (this.bridge.hapticArrange) this.bridge.hapticArrange(BOOT_ARRANGE_MS);
+          else if (this.bridge.hapticTransition) this.bridge.hapticTransition();
+        }
       }
       const home = this.compose('home', A).cells();
       const u = Math.min(1, t / BOOT_ARRANGE_MS);
@@ -745,6 +931,13 @@ class Launcher {
       this.hits = [];                                    // nothing is tappable mid-flight
     } else {
       const g = this.compose(this.screen, A);
+      // A fullscreen scene owns the whole panel: blank what the screen drew and let the
+      // scene have the grid. Nothing else changes, so a scene can never break navigation —
+      // the screen underneath is still live and still handling taps.
+      if (this.sceneAt && this.sceneAt('full')) {
+        g.g.fill(0);
+        this.drawScene(g, A, 'full', { c0: 0, r0: 0, c1: 67, r1: s.rows - 1 });
+      }
       // Steady state — no morph, no ripple — is the overwhelmingly common frame. Hand the
       // grid buffer straight to the renderer instead of expanding it into dot objects and
       // splitting it into layers; that alone was most of the per-frame cost.
@@ -777,18 +970,22 @@ class Launcher {
   keyFor(A) {
     const d = new Date(A), st = this.status, w = this.weather;
     const k = [this.screen, this.palName, d.getHours(), d.getMinutes()];
+    if (this.sceneBusy && this.sceneBusy(A)) return null;   // a live scene animates every frame
     if (this.screen === 'home') {
       k.push(d.getMilliseconds() < 500, Math.floor(A / 350) % 2, st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
         st.wifi, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
         st.cpu, st.ram, this.gpuLoad, Math.floor(A / 230) % 4, !!this.activeEvent, this.eventQueue.length,
         this.battWarn() && A % 1000 < 620,               // low-battery blink phase
-        Math.floor(A / 530) % 2);                        // dock terminal cursor blink
+        Math.floor(A / 530) % 2,                         // dock terminal cursor blink
+        this.appCaching(A) ? Math.floor(A / 70) % 12 : 0,     // app-cache throbber
+        (this.status.notif && this.status.notif.length) ? Math.floor(A / 420) % 2 : 0,
+        this.status.notif ? this.status.notif.length : 0);
     }
     else if (this.screen === 'terminal') k.push(Math.floor(A / 530) % 2, this.hist.length, !!this.job);
-    else if (this.screen === 'drawer') k.push(this.drawerTop, this.apps.length);
+    else if (this.screen === 'drawer') k.push(this.drawerTop, this.apps.length, this.apps.length ? 0 : Math.floor(A / 70) % 12);
     else if (this.screen === 'launch') return null;
     else if (this.screen === 'menu') k.push(this.palName, !!this.config.amoled);
-    else if (this.screen === 'settings') k.push(JSON.stringify(this.config));
+    else if (this.screen === 'settings') k.push(JSON.stringify(this.config), this.restoreIx || 0, this.restoreArmed, !!this.resetArmed);
     else if (this.screen === 'quick') {
       k.push(st.wifi, st.bt, st.data, st.loc, Math.floor(A / 160) % 3, Math.floor(A / 260) % 4, A % 900 < 520);
     }
@@ -813,7 +1010,7 @@ class Launcher {
     const g = new DotGrid(s, this.pool[this.poolIx]);
     if (screen === 'home') this.drawHome(g, A);
     else if (screen === 'terminal') this.drawTerminal(g, A);
-    else if (screen === 'drawer') this.drawDrawer(g);
+    else if (screen === 'drawer') this.drawDrawer(g, A);
     else if (screen === 'launch') this.drawLaunch(g, A);
     else if (screen === 'menu') this.drawMenu(g);
     else if (screen === 'settings') this.drawSettings(g);
@@ -918,8 +1115,11 @@ class Launcher {
    */
   drawBootMark(g, A, cy) {
     const top = cy - 12;                                 // 7-row wordmark, then two text lines
-    const u = Math.min(1, (A - this.t0) / BOOT_BRAND_MS);
-    const sweep = MID_L - 8 + u * (MID_R - MID_L + 18);
+    // The bar waits for the dots to land, then crosses the letters (cols 10..56) over
+    // BOOT_SWEEP_MS. Holding it off the left edge until then keeps the flight clean and lets
+    // the sweep haptic line up with what the eye sees.
+    const u = Math.max(0, Math.min(1, (A - this.t0 - BOOT_ARRANGE_MS) / BOOT_SWEEP_MS));
+    const sweep = 7 + u * 52;
     ZERONE.forEach((Lg, i) => {
       const c0 = 10 + i * 8;                             // 6 glyphs, 47 columns, centred on 33.5
       for (let r = 0; r < Lg.length; r++) {
@@ -1034,10 +1234,27 @@ class Launcher {
     // CENTRES, and each glyph is centred in its slot both ways, so the optical gaps stay
     // even no matter which size sits where. Touch targets are uniform regardless of size.
     const dockMid = 137 + dy;
+    // Dock intro: the terminal tile lands first, then its two neighbours slide out from
+    // underneath it, then the outer pair. `u` is 0..1 per ring; at u<0 the tile is not there
+    // yet, so nothing flickers in place before its turn.
+    const dockT = A - this.t0 - DOCK_INTRO_AT;
     this.getDock().forEach((a) => {
       const ic = ICONS[a.id], w = ic[0].length, h = ic.length;
-      const ix = a.cx - (w >> 1), iy = dockMid - (h >> 1);
-      g.bmp2(ic, ix, iy, 1);
+      const ring = a.cx === 33 ? 0 : (a.cx === 20 || a.cx === 46) ? 1 : 2;
+      let ix = a.cx - (w >> 1);
+      const iy = dockMid - (h >> 1);
+      if (dockT < DOCK_INTRO_MS * (ring + 1)) {
+        const u = (dockT - DOCK_INTRO_MS * ring) / DOCK_INTRO_MS;
+        if (u < 0) { this.hits.push([a.hit[0], 130 + dy, a.hit[1], 144 + dy, () => this.open(a.act, a.name)]); return; }
+        // Slide out of the middle slot to its own, easing as it arrives.
+        const from = 33 - (w >> 1);
+        ix = Math.round(from + (ix - from) * easeIO(Math.min(1, u)));
+      }
+      const notif = this.dockNotif(a);
+      // A tile with something waiting pulses between accent and normal; everything else is
+      // drawn flat. The blink is slow enough to read as "look here", not as a fault.
+      g.bmp2(ic, ix, iy, notif && fr(420) ? 2 : 1);
+      if (notif) g.set(ix + w, iy - 1, fr(420) ? 2 : 1);   // corner pip, so it reads while the icon is dim
       // Live prompt: the terminal tile blinks its cursor on the same 530ms cadence as the
       // Termux screen, rather than carrying a dead one baked into the bitmap.
       if (a.id === 'term' && fr(530)) g.hline(ix + 6, ix + 9, iy + 10, 2);
@@ -1048,11 +1265,45 @@ class Launcher {
     if (!fr(530)) g.hline(34, 36, 140 + dy, 0);
     g.hline(4, 63, 145 + dy, 3, 2);
     g.bmp(['..X..', '.X.X.', 'X...X'], 31, 147 + dy, 3);
-    this.hits.push([24, 146 + dy, 43, this.s.rows - 1, () => { this.apps = this.bridge.apps(); this.go('drawer'); }]);
+    // Opening the drawer must not wait on anything: show what is cached and let a background
+    // rebuild catch any app installed since. This tap used to rebuild the list inline.
+    this.hits.push([24, 146 + dy, 43, this.s.rows - 1, () => { this.refreshApps(); this.go('drawer'); }]);
   }
 
   /** True while the battery needs the user's attention (and isn't already on charge). */
   battWarn() { return !this.status.charging && this.status.batt <= BATT_WARN; }
+
+  /**
+   * Does this dock slot's app have a notification waiting? Only slots that resolve to a real
+   * package can be matched — a category shortcut (generic MUSIC, CHAT) has no package to
+   * compare, so it simply never blinks rather than guessing.
+   */
+  dockNotif(a) {
+    const list = this.status.notif;
+    if (!list || !list.length) return false;
+    let pkg = null;
+    if (a.act && a.act.indexOf('pkg:') === 0) pkg = a.act.slice(4);
+    else if (a.act === 'terminal') pkg = 'com.termux';
+    if (!pkg) return false;
+    return list.indexOf(pkg) >= 0;
+  }
+
+  /** True while the app list is still being built. Capped so a failed build can't pin the slot. */
+  appCaching(A) { return !this.appsLoaded && A - this.appsBuildAt < APP_CACHE_WAIT; }
+
+  /**
+   * App cache progress: the orbiting-dot throbber the launch screen uses, so a wait the user
+   * can see reads as the same device rather than a new kind of spinner.
+   */
+  drawAppCache(g, A, cy) {
+    const on = Math.floor(A / 70) % 12;
+    for (let k = 0; k < 12; k++) {
+      const a = (k / 12) * Math.PI * 2;
+      g.set(33.5 + 8 * Math.sin(a), cy - 7 - 8 * Math.cos(a), k === on ? 2 : (k === (on + 11) % 12 ? 1 : 3));
+    }
+    g.text3fit('APP CACHE', MID_L, MID_R, cy + 8, 1, A);
+    g.text3fit('BUILDING', MID_L, MID_R, cy + 15, 3, A);
+  }
 
   /**
    * Which widget owns the middle slot right now — a change here drives the dot morph.
@@ -1063,6 +1314,9 @@ class Launcher {
   midKind(A) {
     const p = this.status.playing ? '+p' : '';
     if (A - this.t0 < BOOT_BRAND_MS) return 'boot';       // outranks everything: it is only ~1.7s
+    const scene = this.sceneAt && this.sceneAt('mid');
+    if (scene) return 'scene:' + scene.sc.name;
+    if (this.appCaching(A)) return 'appcache';            // ~1s on a cold start, then gone
     if (this.rigel && (this.rigel.busy || this.rigel.activeMini || this.rigel.state === 'listening')) return 'rigel' + p;
     if (this.activeEvent) return 'ev:' + this.activeEvent.type + p;
     if (!this.status.charging && this.status.batt < BATT_CRIT) return 'lowbatt' + p;
@@ -1081,6 +1335,10 @@ class Launcher {
     const g = new DotGrid(this.s, this.midBuf);
     if (A - this.t0 < BOOT_BRAND_MS) {
       this.drawBootMark(g, A, cy);
+    } else if (this.sceneAt && this.sceneAt('mid')) {
+      this.drawScene(g, A, 'mid', { c0: MID_L, r0: Math.max(50, cy - 20), c1: MID_R, r1: bottom });
+    } else if (this.appCaching(A)) {
+      this.drawAppCache(g, A, cy);
     } else if (this.rigel && (this.rigel.busy || this.rigel.activeMini || this.rigel.state === 'listening')) {
       const isTool = !!this.rigel.callingTool;
       const isBusy = this.rigel.busy || this.rigel.state === 'busy';
@@ -1446,16 +1704,23 @@ class Launcher {
       { label: 'AGENTIC BACKEND', val: this.agenticStep().label, toggle: () => {
         const i = AGENTIC_BACKENDS.indexOf(this.agenticStep());
         this.config.agentic = AGENTIC_BACKENDS[(i + 1) % AGENTIC_BACKENDS.length].id;
+      }},
+      // Master switch for RIGEL's own interface scenes. Off means nothing RIGEL wrote draws
+      // or listens for a shake — the way out if a scene misbehaves.
+      { label: 'RIGEL SCENES', val: (this.scenesOn() ? 'ON' : 'OFF') + (this.scenes && this.scenes.length ? ' (' + this.scenes.length + ')' : ''), toggle: () => {
+        this.config.scenes = this.config.scenes === false ? true : false;
+        this.stopScenes();
+        this.syncShakeSensor();
       }}
     ];
 
     sysRows.forEach((row, i) => this.settingsRow(g, row, 116 + i * 10));
 
-    g.text3('* BETA', 12, 191, 3);
-    g.hline(8, 127, 198, 3, 2);
+    g.text3('* BETA', 12, 199, 3);
+    g.hline(8, 127, 203, 3, 2);
 
     // Test Audio toggle
-    const audioY = 206;
+    const audioY = 207;
     g.frame(16, audioY, 120, audioY + 12, 3);
     g.text3c(this.status.playing ? 'STOP DEMO AUDIO' : 'TEST DEMO AUDIO', 67.5, audioY + 4, 1);
     this.hits.push([16, audioY, 120, audioY + 12, () => {
@@ -1464,13 +1729,13 @@ class Launcher {
     }]);
 
     // Guide
-    const guideY = 224;
+    const guideY = 222;
     g.frame(16, guideY, 120, guideY + 12, 3);
     g.text3c('HOW TO USE THIS LAUNCHER', 67.5, guideY + 4, 1);
     this.hits.push([16, guideY, 120, guideY + 12, () => this.go('guide')]);
 
     // Test Event button
-    const testY = 242;
+    const testY = 237;
     g.frame(16, testY, 120, testY + 12, 3);
     g.text3c('TEST EVENT BANNERS', 67.5, testY + 4, 1);
     this.hits.push([16, testY, 120, testY + 12, () => {
@@ -1478,19 +1743,57 @@ class Launcher {
     }]);
 
     // Media permissions button
-    const permY = 260;
+    const permY = 252;
     g.frame(16, permY, 120, permY + 12, 3);
     g.text3c('GRANT MEDIA + AUDIO ACCESS', 67.5, permY + 4, 1);
     this.hits.push([16, permY, 120, permY + 12, () => {
       this.bridge.openNotificationAccess();
     }]);
 
+    // Recovery: step back through recorded states, or drop the lot.
+    const recY = 267;
+    const snap = this.restoreTarget();
+    const tl = this.loadTimeline();
+    g.frame(16, recY, 66, recY + 12, 3);
+    g.text3c(snap ? 'UNDO: ' + snap.label + ' ' + this.snapAge(snap) : 'NO HISTORY YET', 41, recY + 4, snap ? 1 : 3);
+    this.hits.push([16, recY, 66, recY + 12, () => {
+      if (!tl.length) return;
+      // First tap picks the state, a second tap on the same one applies it — so a mis-tap
+      // cannot silently roll your launcher back.
+      if (this.restoreArmed === (this.restoreIx || 0)) {
+        this.restoreArmed = -1;
+        this.restoreState(snap);
+        this.go('home');
+        return;
+      }
+      this.restoreArmed = this.restoreIx || 0;
+      this.nudge(200);
+    }]);
+    g.text3c(this.restoreArmed === (this.restoreIx || 0) && snap ? 'TAP AGAIN TO APPLY' : (tl.length > 1 ? 'HOLD-FREE: NEXT >' : ''), 41, recY + 15, 3);
+    // Step to an older snapshot.
+    g.frame(70, recY, 96, recY + 12, 3);
+    g.text3c('OLDER', 83, recY + 4, tl.length > 1 ? 1 : 3);
+    this.hits.push([70, recY, 96, recY + 12, () => {
+      if (tl.length < 2) return;
+      this.restoreIx = ((this.restoreIx || 0) + 1) % tl.length;
+      this.restoreArmed = -1;
+      this.nudge(200);
+    }]);
+    g.frame(100, recY, 120, recY + 12, this.resetArmed ? 9 : 3);
+    g.text3c(this.resetArmed ? 'SURE?' : 'RESET', 110, recY + 4, this.resetArmed ? 9 : 1);
+    this.hits.push([100, recY, 120, recY + 12, () => {
+      if (this.resetArmed && Date.now() - this.resetArmed < 6000) { this.factoryReset(); return; }
+      this.resetArmed = Date.now();
+      this.nudge(200);
+    }]);
+
     // Done button
-    const doneY = 278;
+    const doneY = 285;
     g.frame(26, doneY, 110, doneY + 14, 1);
     g.text3c('DONE (RETURN HOME)', 67.5, doneY + 5, 1);
     this.hits.push([26, doneY, 110, doneY + 14, () => {
       this.bridge.saveConfig(this.config);
+      this.snapshot('SETTINGS');
       this.go('home');
     }]);
   }
@@ -1529,10 +1832,15 @@ class Launcher {
     g.text3('HOLD: OPEN APP', 62 - DotGrid.width3('HOLD: OPEN APP'), 143 + dy, 3);
     this.hits.push([3, 140 + dy, 30, this.s.rows - 1, () => this.go('home')]);
   }
-  drawDrawer(g) {
+  drawDrawer(g, A) {
     const dy = this.dy, apps = this.apps, rows = this.drawerRows(), top = Math.round(this.drawerTop);
     g.text3('APPS', 5, 11, 2); g.text3(String(apps.length), 62 - DotGrid.width3(String(apps.length)), 11, 3);
     g.hline(5, 62, 17, 3, 2);
+    // Opened before the cache landed: same throbber as the middle widget rather than a blank sheet.
+    if (!apps.length) {
+      if (this.appsLoaded) g.text3c('NO APPS', 33.5, Math.round(this.s.rows / 2), 3);
+      else this.drawAppCache(g, A, Math.round(this.s.rows / 2) - 8);
+    }
     apps.slice(top, top + rows).forEach((a, i) => {
       const r = 21 + i * 7, nm = a.label.toUpperCase().replace(/[^A-Z0-9 .\-+&!?']/g, '').slice(0, 12);
       g.bmp(['.XXX.', 'XXXXX', 'XXXXX', 'XXXXX', '.XXX.'], 5, r, a.pkg === 'com.termux' ? 2 : 3);

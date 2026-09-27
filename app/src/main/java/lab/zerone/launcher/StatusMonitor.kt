@@ -223,6 +223,8 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
         o.put("playing", isPlaying)
         o.put("track", track)
         o.put("artist", artist)
+        // Packages with something waiting, so the dock can blink the tile that owns them.
+        o.put("notif", org.json.JSONArray(MediaListenerService.notifPkgs.toList()))
 
         emit(o.toString())
     }

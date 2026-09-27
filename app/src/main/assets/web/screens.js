@@ -240,21 +240,38 @@ function getRigelGlyph(name) {
 }
 
 function parseRigelResponse(raw) {
-  if (!raw) return { text: '', glyph: null };
+  if (!raw) return { text: '', glyph: null, glyphDefs: [], scenes: [], sceneOff: [] };
   let str = String(raw).trim();
 
-  // 1. Extract [GLYPH_DEF:<name>:<pattern>] for inline custom glyph creation
+  // 1. Scenes first, because their bodies are code and must not be run through any of the
+  // prose tidying below. [SCENE:name:trigger:target:ttl]<body>[/SCENE] installs one;
+  // [SCENE_OFF:name] removes it. The body is either JS or "builtin:<name>".
+  const scenes = [];
+  const sceneOff = [];
+  str = str.replace(/\[SCENE:([A-Za-z0-9_-]+):([A-Za-z0-9_:\- ]+?)(?::(mid|full))?(?::(\d+))?\]([\s\S]*?)\[\/SCENE\]/gi,
+    (m, name, trigger, target, ttl, body) => {
+      scenes.push({
+        name: name, trigger: trigger.trim(), target: (target || 'mid').toLowerCase(),
+        ttl: ttl ? +ttl : undefined, body: body.trim()
+      });
+      return ' ';
+    });
+  str = str.replace(/\[SCENE_OFF:([A-Za-z0-9_-]+)\]/gi, (m, name) => { sceneOff.push(name); return ' '; });
+
+  // 2. Extract [GLYPH_DEF:<name>:<pattern>] for inline custom glyph creation
   // Example: [GLYPH_DEF:HEART:..XX...XX..,XXXXX.XXXXX,XXXXXXXXXXX,.XXXXXXXXX...,..XXXXXXX....,...XXXXX....,....XXX......,.....X......]
   let glyph = null;
-  const defMatch = str.match(/\[GLYPH_DEF:([A-Za-z0-9_-]+):([^\]]+)\]/i);
-  if (defMatch) {
-    const defName = defMatch[1].toUpperCase();
-    const pattern = defMatch[2];
+  const glyphDefs = [];
+  str = str.replace(/\[GLYPH_DEF:([A-Za-z0-9_-]+):([^\]]+)\]/gi, (m, name, pattern) => {
+    const defName = name.toUpperCase();
     if (registerCustomGlyph(defName, pattern)) {
       glyph = defName;
+      // Handed back so the caller can write it to ~/.rigel/custom_glyphs.json; a glyph RIGEL
+      // invents mid-reply used to vanish on the next restart.
+      glyphDefs.push({ name: defName, rows: CUSTOM_GLYPHS[defName] });
     }
-    str = str.replace(/\[GLYPH_DEF:[A-Za-z0-9_-]+:[^\]]+\]/gi, '').trim();
-  }
+    return ' ';
+  });
 
   // 2. Extract [GLYPH:<name>]
   const glyphMatch = str.match(/\[GLYPH:([A-Za-z0-9_-]+)\]/i);
@@ -290,7 +307,7 @@ function parseRigelResponse(raw) {
   // 9. Collapse whitespace
   str = str.replace(/\s+/g, ' ').trim();
 
-  return { text: str, glyph: glyph };
+  return { text: str, glyph: glyph, glyphDefs: glyphDefs, scenes: scenes, sceneOff: sceneOff };
 }
 
 
@@ -548,115 +565,172 @@ function parseRigelResponse(raw) {
     g.text3fit(hint, 5, 62, 134, (r.note || isTool) ? 2 : (isThinking ? 1 : 3), A);
   };
 
-  const NEURON_NODES = [
-    [0, 0],           // 0: central soma
-    [-0.7, -0.65],    // 1: top-left
-    [0, -0.85],       // 2: top
-    [0.7, -0.65],     // 3: top-right
-    [-0.85, 0.05],    // 4: mid-left
-    [0.85, -0.05],    // 5: mid-right
-    [-0.65, 0.7],     // 6: bot-left
-    [0, 0.88],        // 7: bottom
-    [0.65, 0.7],      // 8: bot-right
-    [-0.35, -0.3],    // 9: inner top-left
-    [0.35, -0.3],     // 10: inner top-right
-    [-0.35, 0.35],    // 11: inner bot-left
-    [0.35, 0.35]      // 12: inner bot-right
-  ];
+  // ---- thinking: a mesh you fly through -------------------------------------------------
+  // The old version was one fixed ring of 13 nodes with uniform spokes, redrawn in place: it
+  // read as a logo, not as thought. This is a tunnel of nodes at varied sizes, wired to
+  // whichever neighbours they happen to land near (so connection lengths differ), projected
+  // with perspective while the camera flies forward through it and the far end converges.
+  const MESH_N = 110;
+  const MESH_DEPTH = 34;            // model units before the tunnel wraps on itself
+  const MESH_NODES = [];
+  const MESH_EDGES = [];
+  (function buildMesh() {
+    for (let i = 0; i < MESH_N; i++) {
+      // Polar placement: sqrt on the radius spreads nodes evenly over the disc instead of
+      // bunching them at the centre, and keeps the tunnel visually centred.
+      const ang = hash(i, 11, 3) * 6.28318;
+      const rr = Math.sqrt(hash(i, 97, 7)) * 1.75;
+      MESH_NODES.push({
+        x: Math.cos(ang) * rr,
+        y: Math.sin(ang) * rr,
+        z: hash(i, 31, 13) * MESH_DEPTH,
+        r: 0.3 + hash(i, 41, 17) * 1.0,          // node sizes vary by more than 3x
+        f: hash(i, 53, 19) * 6.28                // its own firing phase
+      });
+    }
+    // Reach to the nearest few nodes rather than to a fixed pattern. Whatever distance they
+    // happen to sit at is the edge length, which is what stops the mesh looking woven.
+    for (let i = 0; i < MESH_N; i++) {
+      const a = MESH_NODES[i];
+      const near = [];
+      for (let j = 0; j < MESH_N; j++) {
+        if (j === i) continue;
+        const b = MESH_NODES[j];
+        let dz = b.z - a.z;
+        if (dz > MESH_DEPTH / 2) dz -= MESH_DEPTH;
+        if (dz < -MESH_DEPTH / 2) dz += MESH_DEPTH;
+        near.push([Math.sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + dz * dz), j]);
+      }
+      near.sort((p, q) => p[0] - q[0]);
+      const fan = 1 + Math.floor(hash(i, 67, 23) * 3);      // 1..3 edges out of each node
+      for (let k = 0; k < Math.min(fan, near.length); k++) {
+        if (near[k][0] > 11) continue;
+        MESH_EDGES.push({ a: i, b: near[k][1], s: hash(i, k, 29) });
+      }
+    }
+  })();
 
-  const NEURON_EDGES = [
-    // center to inner
-    [0, 9], [0, 10], [0, 11], [0, 12],
-    // inner to outer dendrites
-    [9, 1], [9, 2], [9, 4],
-    [10, 2], [10, 3], [10, 5],
-    [11, 4], [11, 6], [11, 7],
-    [12, 5], [12, 7], [12, 8],
-    // lateral loops
-    [1, 2], [2, 3], [3, 5], [5, 8], [8, 7], [7, 6], [6, 4], [4, 1]
-  ];
+  const MESH_NEAR = 2.4;            // closer than this and the node has swept past the camera
+  const MESH_FAR = 13;              // the far plane, where the tunnel converges
 
   /**
-   * Neural network thinking visualization: dots rearranged into an interconnected
-   * cortical lattice with firing somas and red action potential pulses racing along dendrites.
+   * How far into the thinking state we are, 0..1, advanced on wall clock so entering and
+   * leaving both animate instead of cutting. The mesh materialises through it and the resting
+   * rings dissolve through its inverse, so the two cross-fade rather than swap.
    */
-  P.drawNeuralNetwork = function (g, A, cx, cy, rad, travel) {
+  P.thinkMix = function (A, want) {
+    if (this._mixAt === undefined) { this._mixAt = A; this._mix = want ? 1 : 0; }
+    const dt = Math.max(0, Math.min(120, A - this._mixAt));
+    this._mixAt = A;
+    const target = want ? 1 : 0;
+    const rate = dt / 380;                                 // ~0.4s each way
+    if (this._mix < target) this._mix = Math.min(target, this._mix + rate);
+    else if (this._mix > target) this._mix = Math.max(target, this._mix - rate);
+    return this._mix;
+  };
+
+  P.drawNeuralNetwork = function (g, A, cx, cy, rad, travel, mix) {
+    const m = mix === undefined ? 1 : mix;
+    if (m <= 0.02) return;
     const t = this.tilt || { x: 0, y: 0 };
-    const breathe = 1 + 0.03 * Math.sin(A / 600);
-    const scale = rad * breathe;
     const tx = travel === undefined ? 5.0 : travel;
-    const ox = -t.x * tx * 0.45;
-    const oy = t.y * tx * 0.35;
+    const focal = rad * 0.9;
+    const camZ = (A / 1000) * 6.5;                         // forward flight through the tunnel
+    // Keep every dot inside the box the caller's widget owns; a node sliding past the camera
+    // projects a long way out and must not scribble over the clock or the dock.
+    const bc0 = cx - rad * 1.7, bc1 = cx + rad * 1.7;
+    const br0 = cy - rad * 1.35, br1 = cy + rad * 1.35;
+    const spread = 2.0;
 
-    const coords = [];
-    for (let i = 0; i < NEURON_NODES.length; i++) {
-      const n = NEURON_NODES[i];
-      const driftX = Math.sin(A / 500 + i * 1.4) * (rad > 16 ? 0.9 : 0.4);
-      const driftY = Math.cos(A / 650 + i * 1.1) * (rad > 16 ? 0.9 : 0.4);
-      coords.push([
-        cx + n[0] * scale + ox + driftX,
-        cy + n[1] * scale + oy + driftY
-      ]);
+    const pts = [];
+    for (let i = 0; i < MESH_N; i++) {
+      const n = MESH_NODES[i];
+      let z = (n.z - camZ) % MESH_DEPTH;
+      if (z < 0) z += MESH_DEPTH;
+      if (z < MESH_NEAR || z > MESH_FAR) { pts.push(null); continue; }
+      const p = focal / z;
+      const depth = 1 - (z - MESH_NEAR) / (MESH_FAR - MESH_NEAR);   // 1 = right in front
+      // The mesh grows out of the centre as it materialises, so entering thinking reads as
+      // the camera diving in rather than a picture appearing.
+      const grow = 0.25 + 0.75 * m;
+      pts.push({
+        x: cx + (n.x * p * spread) * grow - t.x * tx * depth * 0.5,
+        y: cy + (n.y * p * spread) * grow + t.y * tx * depth * 0.4,
+        d: depth,
+        // Dot size comes from the node's own radius scaled by depth, not by the raw
+        // projection — otherwise everything close to the camera becomes a blob.
+        r: n.r * (0.35 + depth * 2.0),
+        f: n.f,
+        z: z
+      });
     }
 
-    // Synaptic dendrite pathways
-    for (let e = 0; e < NEURON_EDGES.length; e++) {
-      const [i1, i2] = NEURON_EDGES[e];
-      const p1 = coords[i1], p2 = coords[i2];
-      const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
-      const dist = Math.hypot(dx, dy);
-      const steps = Math.max(3, Math.round(dist * 1.1));
-      for (let s = 1; s < steps; s++) {
-        const u = s / steps;
-        g.set(p1[0] + dx * u, p1[1] + dy * u, 3);
+    const inBox = (x, y) => x >= bc0 && x <= bc1 && y >= br0 && y <= br1;
+
+    // Connections first, so nodes sit on top of them.
+    for (let e = 0; e < MESH_EDGES.length; e++) {
+      const ed = MESH_EDGES[e];
+      const p1 = pts[ed.a], p2 = pts[ed.b];
+      if (!p1 || !p2) continue;
+      if (Math.abs(p1.z - p2.z) > MESH_DEPTH / 3) continue;     // wrapped apart, not a real edge
+      if (m < 1 && hash(e, 3, 11) > m) continue;                // materialise edge by edge
+      const dx = p2.x - p1.x, dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy);
+      // A near node wired to a far one projects as a streak right across the widget, which
+      // reads as noise rather than structure. Keep the wiring local on screen.
+      if (len < 1 || len > rad * 1.25) continue;
+      const depth = (p1.d + p2.d) / 2;
+      // Far connections thin out to a dotted trace; near ones are solid.
+      const step = depth > 0.55 ? 1 : depth > 0.3 ? 1.7 : 2.6;
+      const v = depth > 0.6 ? 3 : 3;
+      for (let q = step; q < len; q += step) {
+        const u = q / len;
+        const x = p1.x + dx * u, y = p1.y + dy * u;
+        if (inBox(x, y)) g.set(x, y, v);
+      }
+      // Signals running the wire — only on some edges, and only when close enough to read.
+      if (depth > 0.28) {
+        const ph = ((A * (0.00035 + ed.s * 0.0009) + ed.s) % 1);
+        const sx = p1.x + dx * ph, sy = p1.y + dy * ph;
+        if (inBox(sx, sy)) g.set(sx, sy, depth > 0.62 ? 9 : 5);
+        const tp = ph - 0.11;
+        if (tp > 0) {
+          const ax = p1.x + dx * tp, ay = p1.y + dy * tp;
+          if (inBox(ax, ay)) g.set(ax, ay, 5);
+        }
       }
     }
 
-    // Action potential pulses travelling through dendrites
-    for (let e = 0; e < NEURON_EDGES.length; e++) {
-      const [i1, i2] = NEURON_EDGES[e];
-      const p1 = coords[i1], p2 = coords[i2];
-      const dx = p2[0] - p1[0], dy = p2[1] - p1[1];
-
-      const speed = 0.0016 + (e % 5) * 0.0003;
-      const phase = ((A * speed + e * 0.28) % 1.0);
-
-      const hx = p1[0] + dx * phase;
-      const hy = p1[1] + dy * phase;
-
-      // Bright red dot for action potential pulse
-      g.set(Math.round(hx), Math.round(hy), 9);
-
-      // Amber depolarizing trail
-      const trailPhase = phase - 0.12;
-      if (trailPhase > 0) {
-        const txp = p1[0] + dx * trailPhase;
-        const typ = p1[1] + dy * trailPhase;
-        g.set(Math.round(txp), Math.round(typ), 5);
+    // Nodes: size and brightness both fall off with distance, so the eye reads depth.
+    for (let i = 0; i < MESH_N; i++) {
+      const q = pts[i];
+      if (!q) continue;
+      if (m < 1 && hash(i, 7, 5) > m) continue;
+      const firing = Math.sin(A / 240 + q.f) > 0.62;
+      const v = firing ? 9 : q.d > 0.55 ? 1 : q.d > 0.28 ? 2 : 3;
+      if (!inBox(q.x, q.y)) continue;
+      g.set(q.x, q.y, v);
+      const size = q.r;
+      if (size > 0.85) {                                   // mid-distance: a small cross
+        if (inBox(q.x - 1, q.y)) g.set(q.x - 1, q.y, firing ? 5 : v);
+        if (inBox(q.x + 1, q.y)) g.set(q.x + 1, q.y, firing ? 5 : v);
+        if (inBox(q.x, q.y - 1)) g.set(q.x, q.y - 1, firing ? 5 : v);
+        if (inBox(q.x, q.y + 1)) g.set(q.x, q.y + 1, firing ? 5 : v);
       }
-    }
-
-    // Neuron somas (cell bodies)
-    for (let i = 0; i < coords.length; i++) {
-      const [nx, ny] = coords[i];
-      const isFiring = Math.sin(A / 220 + i * 1.8) > 0.65;
-      const somaV = isFiring ? 9 : 1;
-
-      g.set(Math.round(nx), Math.round(ny), somaV);
-
-      if (rad >= 16) {
-        const ringV = isFiring ? 5 : 2;
-        g.set(Math.round(nx) - 1, Math.round(ny), ringV);
-        g.set(Math.round(nx) + 1, Math.round(ny), ringV);
-        g.set(Math.round(nx), Math.round(ny) - 1, ringV);
-        g.set(Math.round(nx), Math.round(ny) + 1, ringV);
+      if (size > 1.9) {                                    // right in front: a filled blob
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (inBox(q.x + dx, q.y + dy)) g.set(q.x + dx, q.y + dy, firing ? 9 : 1);
+          }
+        }
       }
     }
   };
 
   /**
-   * The RIGEL mark: orbital rings at rest, or an interconnected neuron connection
-   * grid firing action potentials while thinking.
+   * The RIGEL mark: orbital rings at rest, the mesh flythrough while thinking, and a real
+   * cross-fade between the two — the rings dissolve ring-dot by ring-dot as the mesh
+   * materialises, instead of one state cutting to the other on a single frame.
    */
   P.drawRigelMark = function (g, A, cx, cy, rad, travel) {
     const t = this.tilt || { x: 0, y: 0 };
@@ -667,13 +741,15 @@ function parseRigelResponse(raw) {
     const isTool = !!this.rigel.callingTool;
     const isThinking = (this.rigel.thinking || isBusy) && !isTool;
 
-    if (isThinking) {
-      this.drawNeuralNetwork(g, A, cx, cy, rad, tx);
+    const mix = this.thinkMix(A, isThinking);
+    if (mix > 0.02) this.drawNeuralNetwork(g, A, cx, cy, rad, tx, mix);
+    if (mix >= 0.98) {
       if (isTool) this.drawCogwheel(g, A, cx, cy);
       return;
     }
 
-    RIGEL_RINGS.forEach((ring) => {
+    const ringMix = 1 - mix;
+    RIGEL_RINGS.forEach((ring, ri) => {
       // depth: 1 for the smallest (front) ring, ~0 for the outermost
       const depth = Math.max(0, Math.min(1, (1.05 - ring.e) / 0.53));
       const ox = -t.x * tx * depth, oy = t.y * tx * 0.6 * depth;
@@ -682,10 +758,13 @@ function parseRigelResponse(raw) {
       // One dot per grid cell of arc, so big and small rings look equally dense.
       const want = Math.max(10, Math.min(pts.length, Math.round(ring.per * R)));
       const step = pts.length / want;
+      // Rings also pull inward as they go, so they look drawn into the mesh.
+      const pull = 0.55 + 0.45 * ringMix;
       for (let k = 0; k < want; k++) {
+        if (ringMix < 1 && hash(k, ri, 13) > ringMix) continue;
         const q = pts[Math.floor(k * step)];
-        let px = cx + q[0] * R + ox;
-        let py = cy + q[1] * R + oy;
+        let px = cx + q[0] * R * pull + ox;
+        let py = cy + q[1] * R * pull + oy;
         g.set(px, py, v);
       }
     });
@@ -938,6 +1017,10 @@ function parseRigelResponse(raw) {
 
       // Stream live response tokens if streamRigel is enabled
       if (this.config.streamRigel !== false && streamText) {
+        // A scene block that has not closed yet is still code; cut the stream there rather
+        // than reading half a program out loud.
+        const open = streamText.indexOf('[SCENE:');
+        if (open >= 0 && streamText.indexOf('[/SCENE]', open) < 0) streamText = streamText.slice(0, open);
         const parsed = parseRigelResponse(streamText);
         if (parsed.text) {
           this.rigel.reply = parsed.text.slice(-1200);
@@ -962,7 +1045,7 @@ function parseRigelResponse(raw) {
         }
       }
 
-      if (this.rigel.busy) setTimeout(() => this.rigelPollStatus(), 250);
+      if (this.rigel.busy) setTimeout(() => this.rigelPollStatus(), 140);
       else if (this.rigel.installing) setTimeout(() => this.rigelPollStatus(), 1500);
       this.lastKey = null;
       return true;
@@ -985,6 +1068,7 @@ function parseRigelResponse(raw) {
         this.rigel.reply = parsed.text.slice(-1200);
         this.rigel.currentGlyph = parsed.glyph;
         this.rigel.note = this.rigel.reply ? '' : 'NO REPLY';
+        this.applyRigelDirectives(parsed);
         // Read it back or flush remaining unuttered speech
         if (this.rigel.reply && this.config.speak && this.bridge.voiceSpeak) {
           const spokenIdx = this.rigel.spokenIndex || 0;
@@ -1008,6 +1092,12 @@ function parseRigelResponse(raw) {
           this.mediaGlyphs = JSON.parse(rawJson);
         }
       } catch (e) {}
+      this.lastKey = null;
+      return true;
+    }
+    if (id && id.indexOf('uiscenes') >= 0) {
+      const rawJson = (stdout || '').trim();
+      if (rawJson && rawJson.startsWith('[')) this.onScenes(rawJson);
       this.lastKey = null;
       return true;
     }
@@ -1084,6 +1174,39 @@ function parseRigelResponse(raw) {
     this.rigel.reply = '';
     this.bridge.rigelAsk(id, b64(prompt));
     this.rigelPollStatus();
+    this.lastKey = null;
+  };
+
+  /** Installs whatever RIGEL asked for in a reply: new glyphs, new scenes, removals. */
+  P.applyRigelDirectives = function (parsed) {
+    if (!parsed) return;
+    const changes = (parsed.glyphDefs || []).length + (parsed.scenes || []).length + (parsed.sceneOff || []).length;
+    // Bank the current state before RIGEL changes the interface, so settings can walk it back.
+    if (changes && this.snapshot) this.snapshot('RIGEL');
+    if (parsed.glyphDefs && parsed.glyphDefs.length && this.bridge.saveGlyph) {
+      parsed.glyphDefs.forEach((d) => {
+        try { this.bridge.saveGlyph(JSON.stringify({ name: d.name, rows: d.rows })); } catch (e) {}
+      });
+    }
+    if (parsed.scenes && parsed.scenes.length && this.addScene) {
+      parsed.scenes.forEach((def) => {
+        const rec = this.addScene(def, true);
+        if (rec && rec.error) this.rigel.note = 'SCENE ' + rec.name + ' ' + rec.error;
+        else if (rec && rec.trigger !== 'always') this.rigel.note = 'SCENE ' + rec.name + ' ARMED';
+        else if (rec) this.startScene(rec);
+      });
+    }
+    if (parsed.sceneOff && parsed.sceneOff.length && this.removeScene) {
+      parsed.sceneOff.forEach((n) => this.removeScene(n));
+    }
+  };
+
+  /** Glyph table accessors for the state timeline, which has to snapshot and restore them. */
+  P.snapshotGlyphs = function () { return JSON.parse(JSON.stringify(CUSTOM_GLYPHS)); };
+
+  P.restoreGlyphs = function (obj) {
+    Object.keys(CUSTOM_GLYPHS).forEach((k) => { delete CUSTOM_GLYPHS[k]; });
+    if (obj) Object.keys(obj).forEach((k) => registerCustomGlyph(k, obj[k]));
     this.lastKey = null;
   };
 

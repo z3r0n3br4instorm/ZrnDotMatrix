@@ -17,14 +17,66 @@ import android.webkit.JavascriptInterface
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Everything the dot-matrix UI can ask Android for. Methods run on the WebView's JS thread. */
 class Bridge(private val act: MainActivity) {
 
     private val pm: PackageManager get() = act.packageManager
 
+    /** Fast path to RIGEL's daemon; Termux is only the fallback when it is not listening. */
+    private val http by lazy { RigelHttp(act) }
+
+    // ---- app list ------------------------------------------------------------------------
+    // loadLabel() opens every installed app's resources to read its name, which costs the
+    // better part of a second on a full phone. That ran on the WebView's JS thread the moment
+    // the drawer opened, freezing the UI mid-gesture. Now it is built on a worker and pushed
+    // to the UI when ready; nothing on the JS thread ever waits for it.
+    @Volatile private var appsJson: String? = null
+    private val appsWorker = Executors.newSingleThreadExecutor()
+    private val appsBuilding = AtomicBoolean(false)
+    private val appsStale = AtomicBoolean(false)
+
+    /** The cached list, or "[]" while the first build runs. Returns immediately, always. */
     @JavascriptInterface
     fun apps(): String {
+        val cached = appsJson
+        if (cached != null) return cached
+        warmApps()
+        return "[]"
+    }
+
+    /** False until the first build has landed, so the UI can show its own progress instead. */
+    @JavascriptInterface
+    fun appsReady(): Boolean = appsJson != null
+
+    /** Kicks a background rebuild; the result arrives through ZL.onApps(). */
+    @JavascriptInterface
+    fun refreshApps() = warmApps()
+
+    /**
+     * Builds the list off the UI and JS threads. Calls that arrive mid-build mark the result
+     * stale and get folded into one more pass, so a package change during a build is not lost.
+     */
+    fun warmApps() {
+        appsStale.set(true)
+        if (!appsBuilding.compareAndSet(false, true)) return
+        appsWorker.execute {
+            try {
+                while (appsStale.getAndSet(false)) {
+                    val json = try { buildApps() } catch (e: Throwable) { "[]" }
+                    appsJson = json
+                    act.js("ZL.onApps(${JSONObject.quote(json)})")
+                }
+            } finally {
+                appsBuilding.set(false)
+                if (appsStale.get() && !appsBuilding.get()) warmApps()   // raced with a new request
+            }
+        }
+    }
+
+    private fun buildApps(): String {
         val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val out = pm.queryIntentActivities(main, 0)
             .filter { it.activityInfo.packageName != act.packageName }
@@ -235,6 +287,10 @@ class Bridge(private val act: MainActivity) {
     @JavascriptInterface fun hapticRipple() = act.haptics.ripple()
     @JavascriptInterface fun hapticTransition() = act.haptics.transition()
     @JavascriptInterface fun hapticTick(scale: Double) = act.haptics.tick(scale.toFloat())
+    /** Boot dot-flight: accelerating cascade that lands on a click. */
+    @JavascriptInterface fun hapticArrange(ms: Double) = act.haptics.arrange(ms.toLong())
+    /** Boot wordmark sweep: soft ticks swelling and fading as the light bar crosses. */
+    @JavascriptInterface fun hapticSweep(ms: Double) = act.haptics.sweep(ms.toLong())
     @JavascriptInterface fun cancelHaptic() = act.haptics.cancel()
 
     /** Global multiplier on every haptic effect; 0 mutes. Driven by the settings screen. */
@@ -343,10 +399,14 @@ class Bridge(private val act: MainActivity) {
     /** The UI turns the accelerometer on only while the RIGEL screen is showing. */
     @JavascriptInterface fun setTiltWanted(v: Boolean) = act.runOnUiThread { act.tiltWanted = v }
 
+    /** Kept separate from tilt: a shake-triggered scene needs the sensor on any screen. */
+    @JavascriptInterface fun setShakeWanted(v: Boolean) = act.runOnUiThread { act.shakeWanted = v }
+
     private fun buildRigelAssetsPush(): String {
         val push = StringBuilder("mkdir -p \$HOME/.rigel/bin \$HOME/.rigel/out \$HOME/.rigel/memory " +
             "\$HOME/.gemini/config/skills/natural-response \$HOME/.gemini/config/skills/rigel-glyphs " +
             "\$HOME/.gemini/config/skills/termux-api \$HOME/.gemini/config/skills/media-glyphs " +
+            "\$HOME/.gemini/config/skills/ui-scenes \$HOME/.agents/skills/ui-scenes " +
             "\$HOME/.agents/skills/natural-response \$HOME/.agents/skills/rigel-glyphs " +
             "\$HOME/.agents/skills/termux-api \$HOME/.agents/skills/media-glyphs")
         val files = listOf(
@@ -358,7 +418,8 @@ class Bridge(private val act: MainActivity) {
             "skills/natural-response/SKILL.md" to listOf("\$HOME/.gemini/config/skills/natural-response/SKILL.md", "\$HOME/.agents/skills/natural-response/SKILL.md"),
             "skills/rigel-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/rigel-glyphs/SKILL.md", "\$HOME/.agents/skills/rigel-glyphs/SKILL.md"),
             "skills/termux-api/SKILL.md" to listOf("\$HOME/.gemini/config/skills/termux-api/SKILL.md", "\$HOME/.agents/skills/termux-api/SKILL.md"),
-            "skills/media-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/media-glyphs/SKILL.md", "\$HOME/.agents/skills/media-glyphs/SKILL.md")
+            "skills/media-glyphs/SKILL.md" to listOf("\$HOME/.gemini/config/skills/media-glyphs/SKILL.md", "\$HOME/.agents/skills/media-glyphs/SKILL.md"),
+            "skills/ui-scenes/SKILL.md" to listOf("\$HOME/.gemini/config/skills/ui-scenes/SKILL.md", "\$HOME/.agents/skills/ui-scenes/SKILL.md")
         )
         for ((asset, dests) in files) {
             val body = try {
@@ -391,7 +452,13 @@ class Bridge(private val act: MainActivity) {
 
     /** One line of install progress + streamed text buffer, polled by the UI. */
     @JavascriptInterface
-    fun rigelStatus(id: String) = runTermux(id, "cat \$HOME/.rigel/status 2>/dev/null || echo NONE; echo '---RIGEL_STREAM---'; cat \$HOME/.rigel/stream 2>/dev/null || true")
+    fun rigelStatus(id: String) {
+        if (http.daemonUp()) return http.status(id) { statusViaTermux(id) }
+        statusViaTermux(id)
+    }
+
+    private fun statusViaTermux(id: String) = runTermux(id,
+        "cat \$HOME/.rigel/status 2>/dev/null || echo NONE; echo '---RIGEL_STREAM---'; cat \$HOME/.rigel/stream 2>/dev/null || true")
 
     /** Abort running RIGEL turn and kill the underlying agy process */
     @JavascriptInterface
@@ -400,47 +467,86 @@ class Bridge(private val act: MainActivity) {
         runTermux("rigelabort", cmd)
     }
 
-    /** Load custom media glyph configuration from Termux */
+    /** Load custom media glyph configuration */
     @JavascriptInterface
     fun mediaGlyphs(id: String) {
-        val cmd = "cat \$HOME/.rigel/media_glyphs.json 2>/dev/null || echo '[]'"
-        runTermux(id, cmd)
+        if (http.daemonUp()) return http.mediaGlyphs(id) { runTermux(id, "cat \$HOME/.rigel/media_glyphs.json 2>/dev/null || echo '[]'") }
+        runTermux(id, "cat \$HOME/.rigel/media_glyphs.json 2>/dev/null || echo '[]'")
     }
 
-    /** Load custom glyph definitions from Termux */
+    /** Load custom glyph definitions */
     @JavascriptInterface
     fun customGlyphs(id: String) {
-        val cmd = "cat \$HOME/.rigel/custom_glyphs.json 2>/dev/null || echo '{}'"
-        runTermux(id, cmd)
+        if (http.daemonUp()) return http.glyphs(id) { runTermux(id, "cat \$HOME/.rigel/custom_glyphs.json 2>/dev/null || echo '{}'") }
+        runTermux(id, "cat \$HOME/.rigel/custom_glyphs.json 2>/dev/null || echo '{}'")
+    }
+
+    /** Persist a glyph RIGEL invented mid-reply, so it survives a restart. */
+    @JavascriptInterface
+    fun saveGlyph(json: String) {
+        if (http.daemonUp()) return http.postQuiet("/custom-glyphs", json)
+        runTermux("glyphsave", "mkdir -p \$HOME/.rigel && printf %s " + shq(json) +
+            " | curl -s -m 2 -X POST http://127.0.0.1:4096/custom-glyphs --data-binary @- >/dev/null 2>&1 || true")
+    }
+
+    /** RIGEL-authored interface scenes: custom triggers and custom drawing. */
+    @JavascriptInterface
+    fun uiScenes(id: String) {
+        if (http.daemonUp()) return http.scenes(id) { runTermux(id, "cat \$HOME/.rigel/ui_scenes.json 2>/dev/null || echo '[]'") }
+        runTermux(id, "cat \$HOME/.rigel/ui_scenes.json 2>/dev/null || echo '[]'")
+    }
+
+    /** Store (or remove) one scene. The daemon merges it into ui_scenes.json. */
+    @JavascriptInterface
+    fun saveScene(json: String) {
+        if (http.daemonUp()) return http.postQuiet("/ui-scenes", json)
+        runTermux("scenesave", "mkdir -p \$HOME/.rigel && printf %s " + shq(json) +
+            " | curl -s -m 2 -X POST http://127.0.0.1:4096/ui-scenes --data-binary @- >/dev/null 2>&1 || true")
     }
 
     /** Reset RIGEL session so user can start a fresh conversation */
     @JavascriptInterface
     fun rigelReset(id: String) {
-        val cmd = "curl -s -X POST http://127.0.0.1:4096/reset >/dev/null 2>&1 || true; echo 'RESET_OK'"
-        runTermux(id, cmd)
+        if (http.daemonUp()) {
+            http.postQuiet("/reset", "")
+            return act.js("ZL.onTermux(${JSONObject.quote(id)},'RESET_OK','',0,'')")
+        }
+        runTermux(id, "curl -s -X POST http://127.0.0.1:4096/reset >/dev/null 2>&1 || true; echo 'RESET_OK'")
     }
 
     /** Dynamically pull models available on the device */
     @JavascriptInterface
     fun rigelModels(id: String) {
-        val cmd = "curl -s http://127.0.0.1:4096/models 2>/dev/null || (export PATH=\"\$HOME/.rigel/bin:/data/data/com.termux/files/usr/bin:\$PATH\"; agy models 2>/dev/null || antigravity models 2>/dev/null)"
-        runTermux(id, cmd)
+        val viaTermux = { runTermux(id, "curl -s http://127.0.0.1:4096/models 2>/dev/null || (export PATH=\"\$HOME/.rigel/bin:/data/data/com.termux/files/usr/bin:\$PATH\"; agy models 2>/dev/null || antigravity models 2>/dev/null)") }
+        if (http.daemonUp()) return http.models(id) { viaTermux() }
+        viaTermux()
     }
 
     /** Set active model */
     @JavascriptInterface
     fun rigelSetModel(id: String, model: String) {
         val safeModel = model.replace("\"", "").replace("'", "").trim()
-        val cmd = "printf %s ${shq(safeModel)} | curl -s -X POST http://127.0.0.1:4096/setmodel --data-binary @- >/dev/null 2>&1 || true"
-        runTermux(id, cmd)
+        val viaTermux = { runTermux(id, "printf %s ${shq(safeModel)} | curl -s -X POST http://127.0.0.1:4096/setmodel --data-binary @- >/dev/null 2>&1 || true") }
+        if (http.daemonUp()) return http.setModel(id, safeModel) { viaTermux() }
+        viaTermux()
     }
 
     /** One RIGEL turn. Pushes the current helper scripts if available, then executes. */
     @JavascriptInterface
     fun rigelAsk(id: String, promptB64: String) {
-        val cmd = buildRigelAssetsPush() + " && \$HOME/.rigel/bin/rigel-run " + JSONObject.quote(id) + " " + JSONObject.quote(promptB64)
-        runTermux(id, cmd)
+        val viaTermux = {
+            runTermux(id, buildRigelAssetsPush() + " && \$HOME/.rigel/bin/rigel-run " +
+                JSONObject.quote(id) + " " + JSONObject.quote(promptB64))
+        }
+        // Straight to the daemon when it is listening: this skips a Termux session spawn per
+        // turn, which was the bulk of the wait before the model had even seen the prompt.
+        if (http.daemonUp()) {
+            val prompt = try {
+                String(android.util.Base64.decode(promptB64, android.util.Base64.DEFAULT), Charsets.UTF_8)
+            } catch (e: Throwable) { "" }
+            if (prompt.isNotEmpty()) return http.ask(id, prompt) { viaTermux() }
+        }
+        viaTermux()
     }
 
     // ---- voice ----

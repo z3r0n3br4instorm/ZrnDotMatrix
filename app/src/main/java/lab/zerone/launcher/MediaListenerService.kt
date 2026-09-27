@@ -7,6 +7,7 @@ import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import java.lang.ref.WeakReference
 
 /**
@@ -22,9 +23,38 @@ class MediaListenerService : NotificationListenerService() {
         MainActivity.current?.get()?.status?.push()
     }
 
+    /**
+     * Which packages are currently showing a notification. The dock blinks the tiles that
+     * have something waiting, so this listener earns its keep twice: media sessions and here.
+     */
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        super.onNotificationPosted(sbn)
+        refreshNotifPkgs()
+    }
+
+    override fun onNotificationRemoved(sbn: StatusBarNotification?) {
+        super.onNotificationRemoved(sbn)
+        refreshNotifPkgs()
+    }
+
+    private fun refreshNotifPkgs() {
+        val next = try {
+            activeNotifications
+                ?.filter { it.isClearable && it.packageName != packageName }
+                ?.map { it.packageName }
+                ?.toSet() ?: emptySet()
+        } catch (e: Throwable) {
+            return
+        }
+        if (next == notifPkgs) return
+        notifPkgs = next
+        MainActivity.current?.get()?.status?.push()
+    }
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         instance = WeakReference(this)
+        refreshNotifPkgs()
         try {
             mm = getSystemService(Context.MEDIA_SESSION_SERVICE) as? MediaSessionManager
             val comp = ComponentName(this, MediaListenerService::class.java)
@@ -68,6 +98,10 @@ class MediaListenerService : NotificationListenerService() {
 
     companion object {
         var instance: WeakReference<MediaListenerService>? = null
+
+        /** Packages with a live, dismissable notification. Empty until the listener connects. */
+        @Volatile var notifPkgs: Set<String> = emptySet()
+            private set
 
         fun getActiveController(context: Context): MediaController? {
             return try {

@@ -11,6 +11,7 @@ const CONFIG_FILE = path.join(RIGEL_HOME, 'config.json');
 const STREAM_FILE = path.join(RIGEL_HOME, 'stream');
 const MEDIA_GLYPHS_FILE = path.join(RIGEL_HOME, 'media_glyphs.json');
 const CUSTOM_GLYPHS_FILE = path.join(RIGEL_HOME, 'custom_glyphs.json');
+const UI_SCENES_FILE = path.join(RIGEL_HOME, 'ui_scenes.json');
 const PORT = 4096;
 
 function setStatus(s) {
@@ -94,6 +95,60 @@ const server = http.createServer((req, res) => {
     return res.end('{"status":"ok","action":"aborted"}\n');
   }
 
+  // Status and streamed text in one response: the launcher polls this several times a second
+  // while a turn runs, and two round trips per poll is one too many.
+  if (req.method === 'GET' && req.url === '/status') {
+    let st = 'NONE';
+    try { st = (fs.readFileSync(STATUS_FILE, 'utf8') || 'NONE').trim() || 'NONE'; } catch (e) {}
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: st, stream: streamedText }) + '\n');
+  }
+
+  // RIGEL-authored interface scenes: { name, trigger, target, ttl, body, enabled }
+  if (req.method === 'GET' && req.url === '/ui-scenes') {
+    let data = '[]';
+    try {
+      if (fs.existsSync(UI_SCENES_FILE)) data = fs.readFileSync(UI_SCENES_FILE, 'utf8') || '[]';
+    } catch (e) {}
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(data + '\n');
+  }
+
+  if (req.method === 'POST' && req.url === '/ui-scenes') {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body);
+        let list = [];
+        if (fs.existsSync(UI_SCENES_FILE)) {
+          try { list = JSON.parse(fs.readFileSync(UI_SCENES_FILE, 'utf8') || '[]'); } catch (_) {}
+        }
+        if (!Array.isArray(list)) list = [];
+        const incoming = Array.isArray(parsed) ? parsed : [parsed];
+        for (const sc of incoming) {
+          if (!sc || !sc.name) continue;
+          const key = String(sc.name).toUpperCase().trim();
+          const at = list.findIndex(x => x && String(x.name).toUpperCase().trim() === key);
+          if (sc.remove) {
+            if (at >= 0) list.splice(at, 1);
+          } else if (at >= 0) {
+            list[at] = Object.assign({}, list[at], sc, { name: key });
+          } else {
+            list.push(Object.assign({ enabled: true }, sc, { name: key }));
+          }
+        }
+        fs.writeFileSync(UI_SCENES_FILE, JSON.stringify(list, null, 2));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ status: 'ok', scenes: list.length }) + '\n');
+      } catch (e) {
+        res.writeHead(400);
+        return res.end(JSON.stringify({ error: e.message }) + '\n');
+      }
+    });
+    return;
+  }
+
   if (req.method === 'GET' && req.url === '/stream') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ text: streamedText }) + '\n');
@@ -130,6 +185,11 @@ const server = http.createServer((req, res) => {
         let current = {};
         if (fs.existsSync(CUSTOM_GLYPHS_FILE)) {
           try { current = JSON.parse(fs.readFileSync(CUSTOM_GLYPHS_FILE, 'utf8') || '{}'); } catch (_) {}
+        }
+        if (parsed.reset) {
+          fs.writeFileSync(CUSTOM_GLYPHS_FILE, '{}');
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ status: 'ok', reset: true }) + '\n');
         }
         if (parsed.name && (parsed.rows || parsed.pattern)) {
           current[String(parsed.name).toUpperCase().trim()] = parsed.rows || parsed.pattern;

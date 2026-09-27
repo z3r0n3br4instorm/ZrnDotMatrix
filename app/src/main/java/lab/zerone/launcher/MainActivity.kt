@@ -15,6 +15,7 @@ import android.view.WindowManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebSettings
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import androidx.activity.ComponentActivity
@@ -37,10 +38,12 @@ class MainActivity : ComponentActivity() {
     lateinit var web: WebView
     lateinit var status: StatusMonitor
     lateinit var haptics: HapticManager
+    lateinit var bridge: Bridge
     lateinit var audio: AudioCapture
     lateinit var tilt: Tilt
     lateinit var voice: Voice
     private var screenWasOff = false
+    private var userPresent = false                      // false while a keyguard stands between us
     private var resumed = false
 
     /** True while this activity is resumed — read by the UI through Bridge.isForeground(). */
@@ -49,8 +52,40 @@ class MainActivity : ComponentActivity() {
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (i.action == Intent.ACTION_SCREEN_OFF) screenWasOff = true
+            when (i.action) {
+                Intent.ACTION_SCREEN_OFF -> { screenWasOff = true; userPresent = false }
+                // Screen-on is not the moment to replay the boot. With a secure keyguard the
+                // panel lights up on the lock screen and the unlock can be seconds later —
+                // a replay started here is long over by the time the launcher is visible.
+                // Without a keyguard there is no unlock to wait for, so go at once.
+                Intent.ACTION_SCREEN_ON -> if (!keyguardLocked()) { userPresent = true; maybeWake() }
+                Intent.ACTION_USER_PRESENT -> { userPresent = true; maybeWake() }
+            }
         }
+    }
+
+    private val pkgReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (::bridge.isInitialized) bridge.warmApps()
+        }
+    }
+
+    private fun keyguardLocked(): Boolean = try {
+        (getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager)?.isKeyguardLocked == true
+    } catch (e: Throwable) {
+        false
+    }
+
+    /**
+     * Replays the boot sequence once the screen has been off AND the user is through the
+     * keyguard AND we are the resumed activity. Whichever of those lands last triggers it;
+     * the JS side then starts the animation on its first drawn frame, so nothing is lost if
+     * the WebView is still catching up.
+     */
+    private fun maybeWake() {
+        if (!resumed || !screenWasOff || !userPresent) return
+        screenWasOff = false
+        js("ZL.wake()")
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -85,6 +120,11 @@ class MainActivity : ComponentActivity() {
             settings.allowContentAccess = false
             settings.setSupportZoom(false)
             settings.mediaPlaybackRequiresUserGesture = true
+            // The UI is read straight off local assets, so HTTP caching buys nothing — and it
+            // costs correctness: WebViewAssetLoader serves its URLs without cache headers, so
+            // Chromium caches them heuristically and an in-place APK update can keep running
+            // the previous build's JS out of the cache.
+            settings.cacheMode = WebSettings.LOAD_NO_CACHE
         }
         val assets = WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
@@ -109,12 +149,14 @@ class MainActivity : ComponentActivity() {
                 return true
             }
         }
-        web.addJavascriptInterface(Bridge(this), "ZLNative")
+        bridge = Bridge(this)
+        web.addJavascriptInterface(bridge, "ZLNative")
+        bridge.warmApps()                                // start reading app labels before the UI asks
         setContentView(web)
         web.loadUrl("https://appassets.androidplatform.net/assets/web/index.html")
 
         audio = AudioCapture(this) { json -> js("ZL.onAudio(${JSONObject.quote(json)})") }
-        tilt = Tilt(this) { x, y -> js("ZL.onTilt($x,$y)") }
+        tilt = Tilt(this, { x, y -> js("ZL.onTilt($x,$y)") }, { mag -> js("ZL.onShake($mag)") })
         voice = Voice(this,
             onResult = { text, final -> js("ZL.onVoice(${JSONObject.quote(text)},$final)") },
             onLevel = { lvl -> js("ZL.onVoiceLevel($lvl)") },
@@ -130,7 +172,23 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) { false }
             runOnUiThread { syncAudioCapture() }
         }
-        ContextCompat.registerReceiver(this, screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED)
+        val screenFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        ContextCompat.registerReceiver(this, screenReceiver, screenFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
+
+        // Installing or removing an app used to be picked up by rebuilding the list on every
+        // drawer open — which is what made opening it slow. Rebuild on the event instead.
+        val pkgFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addDataScheme("package")
+        }
+        ContextCompat.registerReceiver(this, pkgReceiver, pkgFilter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() { js("ZL.back()") }
@@ -151,9 +209,13 @@ class MainActivity : ComponentActivity() {
     var tiltWanted = false
         set(v) { field = v; syncTilt() }
 
+    /** Set by the UI when a RIGEL scene is listening for a shake. */
+    var shakeWanted = false
+        set(v) { field = v; syncTilt() }
+
     fun syncTilt() {
         if (!::tilt.isInitialized) return
-        if (resumed && tiltWanted) tilt.start() else tilt.stop()
+        if (resumed && (tiltWanted || shakeWanted)) tilt.start() else tilt.stop()
     }
 
     /** Runs the Visualizer only while we are resumed and media is playing. */
@@ -221,7 +283,12 @@ class MainActivity : ComponentActivity() {
         syncAudioCapture()
         syncTilt()
         js("ZL.resume()")                                              // restart the frame loop, replay the closing morph
-        if (screenWasOff) { screenWasOff = false; js("ZL.wake()") }     // screen came on: play the ZERONE splash
+        // Resuming behind the keyguard (screen-on on the lock screen, or a cold start while
+        // locked): nothing drawn now will be seen, so bank the replay for the unlock. Never
+        // revoke presence here — isKeyguardLocked still reads true while the dismiss animation
+        // runs, and clearing the flag after USER_PRESENT had landed killed the replay outright.
+        if (keyguardLocked()) screenWasOff = true else userPresent = true
+        maybeWake()                                                    // owed a boot replay? play it now
         WindowInsetsControllerCompat(window, window.decorView).hide(WindowInsetsCompat.Type.systemBars())
     }
 
@@ -243,6 +310,7 @@ class MainActivity : ComponentActivity() {
         tilt.stop()
         voice.destroy()
         unregisterReceiver(screenReceiver)
+        try { unregisterReceiver(pkgReceiver) } catch (_: Exception) {}
         web.destroy()
         super.onDestroy()
     }

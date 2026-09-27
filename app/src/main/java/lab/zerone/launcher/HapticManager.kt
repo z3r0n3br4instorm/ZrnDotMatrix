@@ -32,21 +32,39 @@ class HapticManager(private val context: Context) {
         null
     }
 
-    private val supportsTick: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && vibrator != null) {
-        try {
-            vibrator.areAllPrimitivesSupported(VibrationEffect.Composition.PRIMITIVE_TICK)
-        } catch (e: Throwable) {
-            false
-        }
-    } else false
+    /** Composition primitive ids are plain compile-time ints; the probe itself needs API 30. */
+    private fun hasPrimitive(id: Int): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && vibrator != null) {
+            try {
+                vibrator.areAllPrimitivesSupported(id)
+            } catch (e: Throwable) {
+                false
+            }
+        } else false
 
-    private val supportsLowTick: Boolean = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && vibrator != null) {
-        try {
-            vibrator.areAllPrimitivesSupported(VibrationEffect.Composition.PRIMITIVE_LOW_TICK)
-        } catch (e: Throwable) {
-            false
-        }
-    } else false
+    private val supportsTick: Boolean = hasPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK)
+    private val supportsLowTick: Boolean = hasPrimitive(VibrationEffect.Composition.PRIMITIVE_LOW_TICK)
+    private val supportsClick: Boolean = hasPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK)
+    private val supportsQuickRise: Boolean = hasPrimitive(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE)
+
+    /** The composition length cap is not public API, so stay well inside what LRAs accept. */
+    private val maxPrimitives: Int = 20
+
+    /**
+     * How long each primitive actually plays on this motor, so the cascades below add up to the
+     * animation they are pacing. Reported from API 31; the fallbacks are Pixel-class nominals.
+     */
+    private fun primitiveMs(id: Int, fallback: Long): Long = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && vibrator != null) {
+            vibrator.getPrimitiveDurations(id).firstOrNull()?.toLong()?.takeIf { it > 0 } ?: fallback
+        } else fallback
+    } catch (e: Throwable) {
+        fallback
+    }
+
+    private val tickMs: Long by lazy { primitiveMs(VibrationEffect.Composition.PRIMITIVE_TICK, TICK_MS) }
+    private val lowTickMs: Long by lazy { primitiveMs(VibrationEffect.Composition.PRIMITIVE_LOW_TICK, LOW_TICK_MS) }
+    private val quickRiseMs: Long by lazy { primitiveMs(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE, QUICK_RISE_MS) }
 
     /** VibrationEffect and amplitude control both arrived in API 26; below that we cannot
      *  shape a vibration at all, only switch the motor on and off. */
@@ -196,6 +214,111 @@ class HapticManager(private val context: Context) {
     }
 
     /**
+     * Boot: dots lifting out of scatter and settling into the home screen. A soft rise while
+     * the field is in flight, then micro-ticks that pack tighter as it converges, and one
+     * firmer click on the frame everything lands. `durationMs` is the visual flight time.
+     *
+     * Primitive lengths below are the nominal ones a Pixel-class LRA reports (TICK 5ms,
+     * QUICK_RISE 150ms); another motor may differ by a few ms, which only shifts the feel
+     * slightly — the shape of the cascade is what carries the sensation.
+     */
+    fun arrange(durationMs: Long) {
+        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        val dur = durationMs.coerceIn(200L, 3000L)
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
+                val tick = if (supportsTick) {
+                    VibrationEffect.Composition.PRIMITIVE_TICK
+                } else {
+                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                }
+                val unit = if (supportsTick) tickMs else lowTickMs
+                val comp = VibrationEffect.startComposition()
+                var budget = dur
+                if (supportsQuickRise) {
+                    comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE, p(0.30f), 0)
+                    budget -= quickRiseMs                    // the rise owns the head of the flight
+                }
+                // Landing times follow (i/n)^0.6, so the gaps shrink and the cascade accelerates.
+                val n = (maxPrimitives - 2).coerceIn(4, 10)
+                var prev = 0L
+                for (i in 1..n) {
+                    val at = (budget.coerceAtLeast(120L) * Math.pow(i.toDouble() / n, 0.6)).toLong()
+                    val gap = (at - prev - unit).coerceAtLeast(0L)
+                    comp.addPrimitive(tick, p(0.10f + 0.22f * i / n.toFloat()), gap.toInt())
+                    prev = at
+                }
+                if (supportsClick) {
+                    comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, p(0.45f), 0)
+                } else {
+                    comp.addPrimitive(tick, p(0.40f), 0)
+                }
+                vibrateEffect(comp.compose())
+            } else if (hasAmplitude) {
+                val n = 8
+                val t = ArrayList<Long>(n * 2 + 2)
+                val a = ArrayList<Int>(n * 2 + 2)
+                var prev = 0L
+                for (i in 1..n) {
+                    val at = (dur * Math.pow(i.toDouble() / n, 0.6)).toLong()
+                    t.add((at - prev - 8L).coerceAtLeast(4L)); a.add(0)
+                    t.add(8L); a.add(amp(18 + 26 * i / n))
+                    prev = at
+                }
+                t.add(6L); a.add(0)
+                t.add(14L); a.add(amp(70))                   // landing
+                vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
+            }
+        } catch (e: Throwable) {
+            // Gracefully ignore any hardware/driver error
+        }
+    }
+
+    /**
+     * Boot: the light bar crossing the ZERONE wordmark. Evenly spaced soft ticks under a bell
+     * curve — it swells as the bar reaches the middle of the letters and fades as it leaves,
+     * so it reads as something brushing across the panel. Deliberately unlike `arrange`:
+     * no rise, no closing click, even spacing, and the gentlest primitive the motor has.
+     */
+    fun sweep(durationMs: Long) {
+        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        val dur = durationMs.coerceIn(200L, 3000L)
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsLowTick || supportsTick)) {
+                val soft = if (supportsLowTick) {
+                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                } else {
+                    VibrationEffect.Composition.PRIMITIVE_TICK
+                }
+                val unit = if (supportsLowTick) lowTickMs else tickMs
+                val n = (dur / 62L).toInt().coerceIn(6, maxPrimitives)
+                val gap = ((dur - n * unit) / (n - 1)).coerceAtLeast(0L).toInt()
+                val comp = VibrationEffect.startComposition()
+                for (i in 0 until n) {
+                    val bell = Math.sin(Math.PI * i / (n - 1))       // 0 → 1 → 0 across the letters
+                    comp.addPrimitive(soft, p((0.05 + 0.20 * bell).toFloat()), if (i == 0) 0 else gap)
+                }
+                vibrateEffect(comp.compose())
+            } else if (hasAmplitude) {
+                val n = (dur / 62L).toInt().coerceIn(6, 24)
+                val gap = ((dur - n * 8L) / (n - 1)).coerceAtLeast(4L)
+                val t = ArrayList<Long>(n * 2)
+                val a = ArrayList<Int>(n * 2)
+                for (i in 0 until n) {
+                    val bell = Math.sin(Math.PI * i / (n - 1))
+                    t.add(if (i == 0) 0L else gap); a.add(0)
+                    t.add(8L); a.add(amp((8 + 34 * bell).toInt()))
+                }
+                vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
+            }
+        } catch (e: Throwable) {
+            // Gracefully ignore any hardware/driver error
+        }
+    }
+
+    /**
      * Plays a single tiny tick vibration.
      */
     fun tick(scale: Float = 0.25f) {
@@ -223,6 +346,12 @@ class HapticManager(private val context: Context) {
         } catch (e: Throwable) {
             // Gracefully ignore
         }
+    }
+
+    private companion object {
+        const val TICK_MS = 5L
+        const val LOW_TICK_MS = 12L
+        const val QUICK_RISE_MS = 150L
     }
 
     private fun vibrateEffect(effect: VibrationEffect) {
