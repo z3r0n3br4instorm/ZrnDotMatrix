@@ -844,14 +844,23 @@ class Launcher {
       if (this.initialStatusReceived) {
         // Titles are kept short on purpose: drawEventWidget centres them inside the
         // widget's padding box and anything longer would scroll instead of sitting still.
+        //
+        // ACTIVE/INACTIVE rather than CONNECTED: `bt` is the adapter's on/off state, not
+        // "a device connected", and `wifi`/`data` are "this is the current default route",
+        // not "a cable just got plugged in" — CONNECTED implied a handshake that didn't
+        // happen, and never fired at all when the radio or route went away.
         if (s.wifi && !this.lastWifi) {
-          this.enqueueEvent({ type: 'wifi', title: 'WIFI CONNECTED', sub: (s.ssid || 'CONNECTED').toUpperCase() });
+          this.enqueueEvent({ type: 'wifi', title: 'WIFI ACTIVE', sub: (s.ssid || 'CONNECTED').toUpperCase() });
+        } else if (!s.wifi && this.lastWifi) {
+          this.enqueueEvent({ type: 'wifi', title: 'WIFI INACTIVE', sub: 'DISCONNECTED' });
         }
         if (s.bt && !this.lastBt) {
-          this.enqueueEvent({ type: 'bt', title: 'BT CONNECTED', sub: 'BLUETOOTH' });
+          this.enqueueEvent({ type: 'bt', title: 'BLUETOOTH ACTIVE', sub: 'RADIO ON' });
+        } else if (!s.bt && this.lastBt) {
+          this.enqueueEvent({ type: 'bt', title: 'BLUETOOTH INACTIVE', sub: 'RADIO OFF' });
         }
-        if (s.data && !this.lastData && !s.wifi) {
-          this.enqueueEvent({ type: 'data', title: 'DATA CONNECTED', sub: 'MOBILE DATA' });
+        if (!s.wifi && s.data !== this.lastData) {
+          this.enqueueEvent({ type: 'data', title: s.data ? 'DATA ACTIVE' : 'DATA INACTIVE', sub: 'MOBILE DATA' });
         }
       } else {
         this.initialStatusReceived = true;
@@ -1684,21 +1693,13 @@ class Launcher {
     const cx = 33, gcy = cy - 8;                         // glyph centre; text hangs below
     g.bmp(BT_BIG, cx - Math.floor(BT_BIG[0].length / 2), gcy - Math.floor(BT_BIG.length / 2), 1);
 
-    // three arcs leaving the glyph on both sides, each restarting as it fades out.
-    // They start clear of the 9x13 rune so the two never tangle.
-    const phase = (A % 1200) / 1200;
-    for (let k = 0; k < 3; k++) {
-      const f = (phase + k / 3) % 1;                     // 0 just off the glyph, 1 fully out
-      const R = 10 + f * 7;
-      const v = f > 0.75 ? 3 : f < 0.2 ? 1 : 2;
-      // wider sweep up close, narrower far out, so even the inner arc reads as a curve
-      const spread = 46 - 14 * f;
-      for (let a = -spread; a <= spread; a += 2) {       // 2° keeps the arc unbroken at R=17
-        const rad = a * Math.PI / 180;
-        const dx = Math.cos(rad) * R, dy = Math.sin(rad) * R;
-        g.set(cx + dx, gcy + dy, v);
-        g.set(cx - dx, gcy + dy, v);
-      }
+    // Same shockwave RIGEL uses while listening, fired from the glyph on the same cadence,
+    // instead of the sweeping arcs this used to draw.
+    if (A - (this._lastBtRipple || 0) > 750) {
+      this._lastBtRipple = A;
+      const px = (cx + this.sNormal.cOff) * this.sNormal.pitch + this.sNormal.ox;
+      const py = gcy * this.sNormal.pitch + this.sNormal.oy;
+      this.ripple(px, py);
     }
 
     g.text3fit('BLUETOOTH', MID_L, MID_R, gcy + 15, 1, A);
@@ -1760,11 +1761,20 @@ class Launcher {
     const crit = st.batt < BATT_CRIT;
     const tint = crit ? 9 : 5;                           // 9 = red, 5 = amber
     const on = A % 1000 < 620;                           // ~1 Hz blink
-    const top = cy - 17;                                 // 19-row glyph + two text lines = 35 rows
+    const top = cy - 17;                                 // 19-row glyph + text lines below
 
     g.bmp(WARN_TRI, 23, top, on ? tint : 3);
-    g.text3fit(crit ? 'BATTERY CRITICAL' : 'BATTERY LOW', MID_L, MID_R, top + 23, crit ? 9 : tint, A);
-    g.text3fit(st.batt + '% REMAINING', MID_L, MID_R, top + 30, crit ? 9 : 3, A);
+    if (crit) {
+      // "BATTERY CRITICAL" is wider than the widget's box, so text3fit was scrolling it —
+      // easy to miss on a screen you're glancing at for half a second. Split across two
+      // static lines instead; each one fits on its own with room to spare.
+      g.text3fit('BATTERY', MID_L, MID_R, top + 23, 9, A);
+      g.text3fit('CRITICAL', MID_L, MID_R, top + 29, 9, A);
+      g.text3fit(st.batt + '% REMAINING', MID_L, MID_R, top + 36, 9, A);
+    } else {
+      g.text3fit('BATTERY LOW', MID_L, MID_R, top + 23, tint, A);
+      g.text3fit(st.batt + '% REMAINING', MID_L, MID_R, top + 30, 3, A);
+    }
   }
 
   drawCharging(g, A, cy) {

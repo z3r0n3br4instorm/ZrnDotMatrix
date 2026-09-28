@@ -273,7 +273,11 @@ class MainActivity : ComponentActivity() {
 
     private fun askPermissions() {
         val want = mutableListOf(
+            // FINE, not just COARSE: since Android 8.1, COARSE alone isn't enough for
+            // WifiManager to hand back the connected SSID — it silently returns
+            // "<unknown ssid>", which is why the home screen's network name never showed.
             Manifest.permission.ACCESS_COARSE_LOCATION,
+            Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.RECORD_AUDIO,
             TERMUX_PERMISSION
         )

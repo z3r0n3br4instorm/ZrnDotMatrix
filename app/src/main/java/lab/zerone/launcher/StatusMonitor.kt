@@ -358,8 +358,27 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
     }
 
     @Suppress("DEPRECATION")
-    private fun ssid(): String = try {
-        val s = (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).connectionInfo?.ssid ?: ""
-        if (s.contains("unknown")) "" else s.trim('"')
-    } catch (_: Exception) { "" }
+    private fun ssid(): String {
+        // The SSID is withheld unless the app holds ACCESS_FINE_LOCATION specifically —
+        // ACCESS_COARSE_LOCATION stopped being enough once Android 8.1 (API 27) shipped, and
+        // this app only ever asked for coarse, so the read silently failed on every device
+        // since then and returned "<unknown ssid>" no matter how it was queried.
+        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.ACCESS_FINE_LOCATION)
+            != android.content.pm.PackageManager.PERMISSION_GRANTED) return ""
+
+        return try {
+            // On API 31+, WifiManager.connectionInfo is deprecated in favour of reading the
+            // WifiInfo straight off the active network's capabilities — same permission
+            // requirement, but this is the path Android actually keeps working going forward.
+            val s = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val cm = ctx.applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                val caps = cm?.getNetworkCapabilities(cm.activeNetwork)
+                (caps?.transportInfo as? android.net.wifi.WifiInfo)?.ssid
+                    ?: (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).connectionInfo?.ssid
+            } else {
+                (ctx.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager).connectionInfo?.ssid
+            } ?: ""
+            if (s.contains("unknown")) "" else s.trim('"')
+        } catch (_: Exception) { "" }
+    }
 }
