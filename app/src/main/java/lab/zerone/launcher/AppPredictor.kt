@@ -273,6 +273,10 @@ class AppPredictor(private val act: MainActivity) {
     fun predict(): String {
         return try {
             ensureLoaded()
+            // refresh() also tries this, but it runs from onResume and routinely beats the
+            // async app-list build, then the rate limit locks it out for five minutes. By the
+            // time anything asks for a prediction the labels are necessarily there.
+            if (purgeIgnored()) saveAsync()
             val best = bestCandidate()
             // One line per ask: "is the model empty, is nothing clearing the bar, or is the
             // UI simply not drawing what it was given" is otherwise guesswork from outside.
@@ -427,15 +431,16 @@ class AppPredictor(private val act: MainActivity) {
      * Guarded on labelsReady so an empty label map cannot be read as "nothing is launchable"
      * and wipe the model.
      */
-    private fun purgeIgnored() {
-        if (!act.bridge.labelsReady()) return
+    private fun purgeIgnored(): Boolean {
+        if (!act.bridge.labelsReady()) return false
         val dead = stats.keys.filter { ignored(it) }
-        if (dead.isEmpty()) return
+        if (dead.isEmpty()) return false
         val deadSet = dead.toSet()
         for (p in dead) { stats.remove(p); transitions.remove(p); bias.remove(p) }
         for (m in transitions.values) m.keys.removeAll(deadSet)
         pending?.let { if (it.pkg in deadSet) pending = null }
         android.util.Log.d(TAG, "purged ${dead.size} untrackable: ${dead.take(4)}")
+        return true
     }
 
     /**
