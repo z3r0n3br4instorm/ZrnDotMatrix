@@ -920,7 +920,14 @@ class Launcher {
     // mini-RIGEL, so there is no gesture left to dismiss with; instead the suggestion simply
     // stops asking after a while and hands the slot back, rather than sitting there for
     // hours being ignored.
-    if (p && (arrived || p.pkg !== was)) this.predShownAt = Date.now();
+    if (p && (arrived || p.pkg !== was)) {
+      // Start the clock when the widget is actually on screen, not when the refresh ran.
+      // ZL.wake() restarts the boot animation, and midKind returns 'boot' for the whole of
+      // BOOT_BRAND_MS — so timing from now would spend a third of a 5s offer behind the
+      // splash, and a shorter offer would expire before it was ever drawn.
+      const bootEndsAt = this.t0 + BOOT_BRAND_MS;
+      this.predShownAt = Math.max(Date.now(), bootEndsAt);
+    }
     // A dismissal applies to the guess you dismissed, not to the feature: once the model
     // moves on to a different app, that new suggestion is allowed to ask.
     if (p && this.predDismissedPkg && p.pkg !== this.predDismissedPkg) this.predDismissedPkg = '';
@@ -937,7 +944,8 @@ class Launcher {
   predShowing(A) {
     if (!this.pred || !this.pred.pkg) return false;
     if (this.pred.pkg === this.predDismissedPkg) return false;
-    return (A || Date.now()) - this.predShownAt < PRED_OFFER_MS;
+    const elapsed = (A || Date.now()) - this.predShownAt;
+    return elapsed >= 0 && elapsed < PRED_OFFER_MS;   // predShownAt can sit in the future: see refreshPrediction
   }
 
   /**

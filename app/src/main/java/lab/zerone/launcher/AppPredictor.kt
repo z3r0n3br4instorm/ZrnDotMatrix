@@ -196,7 +196,12 @@ class AppPredictor(private val act: MainActivity) {
     fun predict(): String {
         return try {
             ensureLoaded()
-            val best = bestCandidate() ?: return "{}"
+            val best = bestCandidate()
+            // One line per ask: "is the model empty, is nothing clearing the bar, or is the
+            // UI simply not drawing what it was given" is otherwise guesswork from outside.
+            android.util.Log.d(TAG, if (best == null) "no candidate (apps=${stats.size})"
+                       else "suggest ${best.pkg} score=${"%.2f".format(best.score)}")
+            if (best == null) return "{}"
             JSONObject()
                 .put("pkg", best.pkg)
                 .put("label", best.label)

@@ -57,6 +57,10 @@
     voiceShutUp: () => { if (N && N.voiceShutUp) N.voiceShutUp(); },
     copyUnlockCommand: () => (N && N.copyUnlockCommand ? N.copyUnlockCommand() : false),
     openTermuxApp: () => (N && N.openTermuxApp ? N.openTermuxApp() : false),
+    predictApp: () => (N && N.predictApp ? N.predictApp() : '{}'),
+    hasUsageAccess: () => (N && N.hasUsageAccess ? N.hasUsageAccess() : false),
+    openUsageAccess: () => { if (N && N.openUsageAccess) N.openUsageAccess(); },
+    clearPredictions: () => { if (N && N.clearPredictions) N.clearPredictions(); },
     getConfig: () => {
       const defaults = {
         launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true,
