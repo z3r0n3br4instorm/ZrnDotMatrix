@@ -222,6 +222,7 @@ class Launcher {
     };
     this.eventQueue = [];
     this.activeEvent = null;
+    this.setPage = 0;                                    // settings carousel page
     // App prediction: {pkg, label, icon: [rows]} or null. Refreshed on a timer rather than
     // per frame — the model is cheap but not free, and the answer only moves on the hour.
     this.pred = null;
@@ -1025,7 +1026,8 @@ class Launcher {
   }
 
   openSettings() {
-    if (this.screen === 'settings') return;
+    if (this.screen === 'settings') return;             // already here: leave the page you are on
+    this.setPage = 0;                                   // always enter the carousel at the front
     this.go('settings');
   }
 
@@ -1266,7 +1268,7 @@ class Launcher {
     else if (this.screen === 'drawer') k.push(this.drawerTop, this.apps.length, this.apps.length ? 0 : Math.floor(A / 70) % 12);
     else if (this.screen === 'launch') return null;
     else if (this.screen === 'menu') k.push(this.palName, !!this.config.amoled);
-    else if (this.screen === 'settings') k.push(JSON.stringify(this.config), this.restoreIx || 0, this.restoreArmed, !!this.resetArmed);
+    else if (this.screen === 'settings') k.push(JSON.stringify(this.config), this.setPage || 0, this.restoreIx || 0, this.restoreArmed, !!this.resetArmed);
     else if (this.screen === 'quick') {
       k.push(st.wifi, st.bt, st.data, st.loc, Math.floor(A / 160) % 3, Math.floor(A / 260) % 4, A % 900 < 520);
     }
@@ -1977,13 +1979,14 @@ class Launcher {
     }]);
   }
 
-  drawSettings(g) {
-    g.text3c('SETTINGS', 67.5, 12, 1);
-    g.text3c('2X DENSITY SYSTEM CONFIGURATION', 67.5, 20, 3);
-    g.hline(8, 127, 28, 3, 2);
+  // ---- settings, as a carousel -------------------------------------------------------------
+  // It used to be one tall sheet with every control stacked on it, and it had simply run out
+  // of room — adding a single row pushed the last one into the footer. Paging fixes that by
+  // construction rather than by shrinking the gaps: each page gets the whole height, so rows
+  // sit at a comfortable 14 rows apart instead of 9, and there is somewhere to put the next
+  // setting without this happening again.
 
-    g.text3('-- DOCK SHORTCUTS --', 12, 34, 2);
-
+  settingsDockRows() {
     const dockRows = [
       { label: 'DOCK 1 (CAM)', val: this.getCameraDisplayVal(), toggle: () => {
         const cands = this.getCameraCandidates();
@@ -2020,12 +2023,10 @@ class Launcher {
         this.config.musicApp = this.config.dockMusic;
       }}
     ];
+    return dockRows;
+  }
 
-    dockRows.forEach((row, i) => this.settingsRow(g, row, 44 + i * 11));
-
-    g.hline(8, 127, 102, 3, 2);
-    g.text3('-- SYSTEM CONFIGURATION --', 12, 108, 2);
-
+  settingsSysRows() {
     const sysRows = [
       { label: 'LAUNCH DELAY', val: this.config.launchDelay + 'MS', toggle: () => {
         const seq = [800, 1000, 300, 600];
@@ -2075,12 +2076,92 @@ class Launcher {
         if (this.config.bootSeed === 'fp') this.loadFingerprint();
       }}
     ];
+    return sysRows;
+  }
 
-    sysRows.forEach((row, i) => this.settingsRow(g, row, 116 + i * 9));
+  /** The carousel. Rows are sliced out of the flat arrays above rather than duplicated, so
+   *  there is still exactly one definition of every control. */
+  settingsPages() {
+    const sys = this.settingsSysRows();
+    return [
+      { name: 'DOCK SHORTCUTS', rows: this.settingsDockRows() },
+      // BOOT ORIGIN is a system setting, not a RIGEL one — it just happens to sit last in the
+      // flat array, so it is lifted back onto this page rather than left stranded on that one.
+      { name: 'SYSTEM', rows: sys.slice(0, 6).concat(sys.slice(10)) },
+      { name: 'RIGEL', rows: sys.slice(6, 10) },
+      { name: 'TOOLS', tools: true }
+    ];
+  }
 
-    g.text3('* DETECTED BY SYSTEM', 12, 206, 3);
-    g.hline(8, 127, 211, 3, 2);
+  settingsPageCount() { return this.settingsPages().length; }
 
+  /** dir > 0 is a rightward swipe, which walks back toward the first page. */
+  settingsSwipe(dir) {
+    const n = this.settingsPageCount();
+    const next = (this.setPage || 0) - dir;
+    // No wrap: an edge that stops reads as the end of the strip, whereas one that jumps to
+    // the far side reads as a glitch.
+    if (next < 0 || next >= n) return;
+    this.settingsGoPage(next);
+  }
+
+  settingsGoPage(i) {
+    if (i === (this.setPage || 0)) return;
+    this.prevCells = this.cellsSnapshot();
+    this.setPage = i;
+    this.switchAt = Date.now();
+    this.morphMs = 380;
+    this.lastKey = null;
+    if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+  }
+
+  drawSettings(g) {
+    const pages = this.settingsPages();
+    const n = pages.length;
+    const pi = Math.max(0, Math.min(n - 1, this.setPage || 0));
+    const page = pages[pi];
+
+    g.text3c('SETTINGS', 67.5, 12, 1);
+    g.text3c(page.name, 67.5, 20, 2);
+    // Chevrons are the affordance: nothing else on this screen says the sheet moves sideways.
+    if (pi > 0) {
+      g.text3('<', 11, 20, 1);
+      this.hits.push([8, 15, 22, 27, () => this.settingsSwipe(1)]);
+    }
+    if (pi < n - 1) {
+      g.text3('>', 124, 20, 1);
+      this.hits.push([113, 15, 127, 27, () => this.settingsSwipe(-1)]);
+    }
+    g.hline(8, 127, 28, 3, 2);
+
+    if (page.tools) {
+      this.drawSettingsTools(g);
+    } else {
+      page.rows.forEach((row, i) => this.settingsRow(g, row, 44 + i * 14));
+    }
+
+    // Page dots, tappable so the carousel can also be driven without swiping.
+    const dotY = 268;
+    const first = 67.5 - (n - 1) * 3;
+    for (let i = 0; i < n; i++) {
+      const cx = Math.round(first + i * 6);
+      if (i === pi) { g.set(cx, dotY, 1); g.set(cx + 1, dotY, 1); g.set(cx, dotY + 1, 1); g.set(cx + 1, dotY + 1, 1); }
+      else { g.set(cx, dotY, 3); g.set(cx + 1, dotY, 3); }
+      this.hits.push([cx - 2, dotY - 5, cx + 4, dotY + 6, () => this.settingsGoPage(i)]);
+    }
+
+    // Done stays on every page: whichever one you finish on, the way out is in the same place.
+    const doneY = 281;
+    g.frame(26, doneY, 110, doneY + 14, 1);
+    g.text3c('DONE (RETURN HOME)', 67.5, doneY + 5, 1);
+    this.hits.push([26, doneY, 110, doneY + 14, () => {
+      this.bridge.saveConfig(this.config);
+      this.snapshot('SETTINGS');
+      this.go('home');
+    }]);
+  }
+
+  drawSettingsTools(g) {
     // Utilities, two to a line — the sheet does not scroll, so the rows it spends have to earn
     // their space and these four are all one-shot actions.
     const btn = (c0, c1, y, label, tint, act) => {
@@ -2089,19 +2170,19 @@ class Launcher {
       this.hits.push([c0, y, c1, y + 12, act]);
     };
 
-    const rowA = 215;
+    const rowA = 48;
     btn(16, 66, rowA, this.status.playing ? 'STOP DEMO' : 'TEST AUDIO', 3, () => {
       this.toggleDemoPlay();
       this.go('home');
     });
     btn(70, 120, rowA, 'HOW TO USE', 3, () => this.go('guide'));
 
-    const rowB = 231;
+    const rowB = 64;
     btn(16, 66, rowB, 'TEST BANNERS', 3, () => this.testEvents());
     btn(70, 120, rowB, 'MEDIA ACCESS', 3, () => this.bridge.openNotificationAccess());
 
     // Fingerprint position picker.
-    const fpY = 247;
+    const fpY = 80;
     const fpNat = this.loadFingerprint();
     btn(16, 120, fpY, this.config.fp ? 'SENSOR: CUSTOM (EDIT)' :
       (fpNat.found ? 'MAP SENSOR POSITION' : 'MAP SENSOR (UNDETECTED)'), 3, () => {
@@ -2110,7 +2191,7 @@ class Launcher {
     });
 
     // Recovery: step back through recorded states, or drop the lot.
-    const recY = 263;
+    const recY = 96;
     const snap = this.restoreTarget();
     const tl = this.loadTimeline();
     const armed = this.restoreArmed === (this.restoreIx || 0) && !!snap;
@@ -2139,15 +2220,7 @@ class Launcher {
       this.nudge(200);
     });
 
-    // Done button
-    const doneY = 281;
-    g.frame(26, doneY, 110, doneY + 14, 1);
-    g.text3c('DONE (RETURN HOME)', 67.5, doneY + 5, 1);
-    this.hits.push([26, doneY, 110, doneY + 14, () => {
-      this.bridge.saveConfig(this.config);
-      this.snapshot('SETTINGS');
-      this.go('home');
-    }]);
+    g.text3('* DETECTED BY SYSTEM', 12, 116, 3);
   }
 
   drawTerminal(g, A) {

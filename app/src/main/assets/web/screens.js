@@ -317,6 +317,8 @@ function parseRigelResponse(raw) {
   // ---------------- navigation ----------------
   // Home sits in the middle of a three-screen strip.
   P.swipe = function (dir) {
+    // Settings is a sideways strip of pages, so a horizontal swipe belongs to it.
+    if (this.screen === 'settings') { this.settingsSwipe(dir); return; }
     if (this.screen === 'home') {
       this.go(dir > 0 ? 'quick' : 'rigel');
       return;
