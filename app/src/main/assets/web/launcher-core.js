@@ -29,6 +29,8 @@ const COLS = 15;                                        // F3 characters per ter
 // ring-band culling in rippleFx made each one cheap enough to raise this.
 const HI_SCREENS = ['settings', 'rigelsetup'];   // drawn on the 2x dot grid
 const MAX_RIPPLES = 9;
+/** How long an app suggestion offers itself before handing the widget slot back. */
+const PRED_OFFER_MS = 45000;
 const MID_L = 6;
 const MID_R = 61;
 // Boot: the home screen assembles out of scattered dots in BOOT_ARRANGE_MS and is live from
@@ -218,6 +220,10 @@ class Launcher {
     };
     this.eventQueue = [];
     this.activeEvent = null;
+    // App prediction: {pkg, label, icon: [rows]} or null. Refreshed on a timer rather than
+    // per frame — the model is cheap but not free, and the answer only moves on the hour.
+    this.pred = null;
+    this.predShownAt = 0;                                // when the current guess started offering
     this.lastWifi = false;
     this.lastBt = false;
     this.lastData = false;
@@ -882,6 +888,43 @@ class Launcher {
     } catch (e) {}
   }
 
+  /**
+   * Pulls the current guess from the model. Cheap enough to call on a timer, but not per
+   * frame: it walks every learned package and rasterises an icon on a cache miss.
+   */
+  refreshPrediction(arrived) {
+    if (!this.bridge.predictApp) return;
+    let p = null;
+    try {
+      const raw = this.bridge.predictApp();
+      const o = raw ? JSON.parse(raw) : null;
+      if (o && o.pkg && o.label) {
+        p = { pkg: o.pkg, label: String(o.label).toUpperCase(), icon: null };
+        try {
+          const rows = JSON.parse(o.icon || '[]');
+          if (rows.length) p.icon = rows;
+        } catch (e) {}
+      }
+    } catch (e) {
+      p = null;
+    }
+    const was = this.pred && this.pred.pkg;
+    this.pred = p;
+    // The offer window restarts on a new guess, and on arriving back at the home screen —
+    // that second case is the point of the feature. Holding the middle widget is already
+    // mini-RIGEL, so there is no gesture left to dismiss with; instead the suggestion simply
+    // stops asking after a while and hands the slot back, rather than sitting there for
+    // hours being ignored.
+    if (p && (arrived || p.pkg !== was)) this.predShownAt = Date.now();
+    if ((p && p.pkg) !== was) this.lastKey = null;
+  }
+
+  /** Is there a suggestion worth giving the widget slot to right now? */
+  predShowing() {
+    if (!this.pred || !this.pred.pkg) return false;
+    return Date.now() - this.predShownAt < PRED_OFFER_MS;
+  }
+
   /** Live spectrum from AudioCapture (Visualizer on the output mix). */
   onAudio(json) {
     try {
@@ -1159,6 +1202,7 @@ class Launcher {
         st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
         st.wifi, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
         st.cpu, st.ram, this.gpuLoad, !!this.activeEvent, this.eventQueue.length,
+        this.predShowing() ? this.pred.pkg : '',         // app suggestion (static once drawn)
         this.battWarn() && A % 1000 < 620,               // low-battery blink phase
         Math.floor(A / 500) % 2,                         // dock cursor, phase-locked to the colon
         this.appCaching(A) ? Math.floor(A / 70) % 12 : 0,     // app-cache throbber
@@ -1414,6 +1458,10 @@ class Launcher {
           if (this.bridge.voiceStop) this.bridge.voiceStop();
         }
       }]);
+    } else if (this.predShowing() && this.midKindNow === 'pred:' + this.pred.pkg) {
+      // Only armed once the widget has actually settled on the suggestion, so the tap cannot
+      // land on a guess that is still morphing in from whatever was there before.
+      this.hits.push([MID_L, midTop, MID_R, midBot, () => this.open('pkg:' + this.pred.pkg, this.pred.label)]);
     }
 
     // Transport glyphs are drawn by composeMiddle so they morph with the widget; only the
@@ -1530,6 +1578,7 @@ class Launcher {
     if (this.status.playing) return this.status.btAudio ? 'btaudio' : 'wave';
     if (this.status.charging) return 'charge';
     if (this.battWarn()) return 'lowbatt';
+    if (this.predShowing()) return 'pred:' + this.pred.pkg;
     if (this.config.sysStats) return 'sys';
     return 'ctx:' + this.context(A).glyph;
   }
@@ -1601,6 +1650,8 @@ class Launcher {
       this.drawCharging(g, A, cy);
     } else if (this.battWarn()) {
       this.drawLowBattery(g, A, cy);
+    } else if (this.predShowing()) {
+      this.drawPrediction(g, A, cy);
     } else if (this.config.sysStats) {
       this.drawSystemStats(g, A, cy);
     } else {
@@ -1812,6 +1863,27 @@ class Launcher {
       g.text3(label, MID_L, y, 1, MID_L + 11);           // 'CPU' is exactly 11 columns wide
       this.drawMeterBar(g, MID_L + 15, y, MID_R, y + 4, pct);
     });
+  }
+
+  /**
+   * "OPEN <APP>?" with the app's own icon rendered into the grid above it. The icon arrives
+   * from IconDots already in bmp2's alphabet (X main / * accent / + dim), so the four dot
+   * levels carry its shading — that is what makes a real icon readable at 20x20 rather than
+   * a silhouette.
+   */
+  drawPrediction(g, A, cy) {
+    const rows = this.pred.icon;
+    const gh = rows ? rows.length : 0;
+    const gw = rows ? rows[0].length : 0;
+    const blockH = gh + 16;
+    const top = cy - Math.round(blockH / 2);
+    if (rows) g.bmp2(rows, Math.round(33.5 - gw / 2), top, 1);
+    // Two lines, not "OPEN <NAME>?" on one. The 3x5 font costs 4 columns a character in a
+    // 56-column box, so a single line only fits an 8-character name before text3fit gives up
+    // and scrolls it — and a question sliding past while you decide whether to tap it reads
+    // as an alert rather than a prompt. Split, and 13 characters sit still.
+    g.text3fit('OPEN', MID_L, MID_R, top + gh + 4, 3, A);
+    g.text3fit(this.pred.label.slice(0, 13) + '?', MID_L, MID_R, top + gh + 11, 1, A);
   }
 
   drawMeterBar(g, x1, y1, x2, y2, pct) {

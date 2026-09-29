@@ -226,8 +226,17 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
         // Packages with something waiting, so the dock can blink the tile that owns them.
         o.put("notif", org.json.JSONArray(MediaListenerService.notifPkgs.toList()))
 
+        last = o
         emit(o.toString())
     }
+
+    /**
+     * The most recent snapshot, for Kotlin-side readers that want the same numbers the UI has
+     * rather than re-querying every service themselves (AppPredictor uses headphone and
+     * charging state as prediction features). Null until the first push lands.
+     */
+    @Volatile var last: JSONObject? = null
+        private set
 
     /**
      * Is media audio actually routed out over Bluetooth right now? Not the same as the

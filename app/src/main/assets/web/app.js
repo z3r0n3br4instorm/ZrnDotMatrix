@@ -103,9 +103,9 @@
     launchFailed() { L.launchFailed(); },                   // nothing handled the launch intent
     rigelSetupFailed(why) { L.rigelSetupFailed(why); },
     onTermux(id, out, err, code, e) { L.onTermux(id, out, err, code, e); },
-    wake() { pipelineReset(); L.splash(); tickStart(); },    // screen turned on
+    wake() { pipelineReset(); L.splash(); tickStart(); L.refreshPrediction(true); },    // screen turned on
     pause() { L.pausedAt = Date.now(); pipelineReset(); tickStop(); },
-    resume(wakeOwed) { pipelineReset(); tickStart(); L.resumeHome(wakeOwed); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); if (L.refreshScenes) L.refreshScenes(); },   // back on top: replay the closing morph
+    resume(wakeOwed) { pipelineReset(); tickStart(); L.resumeHome(wakeOwed); if (L.refreshCustomGlyphs) L.refreshCustomGlyphs(); if (L.refreshMediaGlyphs) L.refreshMediaGlyphs(); if (L.refreshScenes) L.refreshScenes(); L.refreshPrediction(true); },   // back on top: replay the closing morph
     home() { L.home(); },                                   // home pressed while already home
     settings() { L.openSettings(); },                       // open hidden settings
     back() { return L.back(); },
@@ -294,6 +294,11 @@
     const loc = N.location(); if (loc) { const p = loc.split(','); weather(p[0], p[1]); }
     N.ready();
     L.refreshCustomGlyphs(); L.refreshMediaGlyphs(); L.refreshScenes();
+    // The model needs the app list to resolve a package to a name, and that build is async —
+    // a first pass now would find labels empty and give up, so let it land first.
+    setTimeout(() => L.refreshPrediction(true), 1500);
+    // The guess drifts with the hour, so re-ask periodically rather than only on resume.
+    setInterval(() => L.refreshPrediction(false), 5 * 60 * 1000);
   }
   else L.onApps(bridge.apps());                             // desktop: no native push to wait for
 })();

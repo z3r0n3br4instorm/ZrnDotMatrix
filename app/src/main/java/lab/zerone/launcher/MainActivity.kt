@@ -39,6 +39,7 @@ class MainActivity : ComponentActivity() {
     lateinit var status: StatusMonitor
     lateinit var haptics: HapticManager
     lateinit var bridge: Bridge
+    lateinit var predictor: AppPredictor
     private lateinit var cover: View
     lateinit var audio: AudioCapture
     lateinit var tilt: Tilt
@@ -68,6 +69,9 @@ class MainActivity : ComponentActivity() {
     private val pkgReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
             if (::bridge.isInitialized) bridge.warmApps()
+            // An updated package can ship a new icon; the dot render is cached by package,
+            // so it has to be dropped or the widget keeps showing the old artwork.
+            i.data?.schemeSpecificPart?.let { IconDots.invalidate(it) } ?: IconDots.invalidateAll()
         }
     }
 
@@ -189,6 +193,7 @@ class MainActivity : ComponentActivity() {
         bridge = Bridge(this)
         web.addJavascriptInterface(bridge, "ZLNative")
         bridge.warmApps()                                // start reading app labels before the UI asks
+        predictor = AppPredictor(this)
         // Black sheet over the WebView, raised at screen-off and dropped when the boot's first
         // frame is composited, so a wake never flashes the stale pre-sleep frame.
         val root = android.widget.FrameLayout(this)
@@ -324,6 +329,10 @@ class MainActivity : ComponentActivity() {
         status.start()
         syncAudioCapture()
         syncTilt()
+        // Coming back to the launcher is exactly when a session just ended, so this is the
+        // moment there is new usage data to fold in. Rate-limited internally; off the UI
+        // thread because a first run walks a month of events.
+        if (::predictor.isInitialized) Thread { predictor.refresh() }.start()
         val wakeOwed = screenWasOff || keyguardLocked()
         js("ZL.resume($wakeOwed)")
         if (!wakeOwed) revealUi()

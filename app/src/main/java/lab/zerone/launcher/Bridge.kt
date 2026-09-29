@@ -37,6 +37,15 @@ class Bridge(private val act: MainActivity) {
     private val appsWorker = Executors.newSingleThreadExecutor()
     private val appsBuilding = AtomicBoolean(false)
     private val appsStale = AtomicBoolean(false)
+    /** package -> label, rebuilt alongside appsJson. Lets AppPredictor resolve a name without
+     *  a PackageManager round trip, and tell "uninstalled" apart from "no launcher entry". */
+    @Volatile private var labels: Map<String, String> = emptyMap()
+
+    fun labelFor(pkg: String): String? = labels[pkg]
+
+    /** False until the first app-list build lands. Callers must not read "no label" as
+     *  "not a launchable app" before this is true — the map is simply not populated yet. */
+    fun labelsReady(): Boolean = labels.isNotEmpty()
 
     /** The cached list, or "[]" while the first build runs. Returns immediately, always. */
     @JavascriptInterface
@@ -85,6 +94,7 @@ class Bridge(private val act: MainActivity) {
             .sortedBy { it.first.lowercase() }
         val arr = JSONArray()
         out.forEach { arr.put(JSONObject().put("label", it.first).put("pkg", it.second)) }
+        labels = out.associate { it.second to it.first }
         return arr.toString()
     }
 
@@ -120,11 +130,43 @@ class Bridge(private val act: MainActivity) {
         }
         try {
             act.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            // Only the resolved package is worth learning from — "camera"/"browser" style
+            // actions can land on a different app each time depending on what is installed.
+            i.`package`?.let { act.predictor.noteLaunch(it) }
+                ?: if (action.startsWith("pkg:")) act.predictor.noteLaunch(action.removePrefix("pkg:")) else Unit
         } catch (e: ActivityNotFoundException) {
             Toast.makeText(act, "No app for that", Toast.LENGTH_SHORT).show()
             act.js("ZL.launchFailed()")
         }
     }
+
+    // ---- app prediction --------------------------------------------------------------------
+
+    /** Best guess for what you are about to open, as JSON, or "{}" when nothing is confident. */
+    @JavascriptInterface
+    fun predictApp(): String = act.predictor.predict()
+
+    /** True once the user has granted usage access; the model works without it, just worse. */
+    @JavascriptInterface
+    fun hasUsageAccess(): Boolean = act.predictor.hasUsageAccess()
+
+    /**
+     * Opens the Settings page for usage access. It cannot be granted in-app — it is a special
+     * access, deliberately gated behind Settings — so all a launcher can do is take you there.
+     */
+    @JavascriptInterface
+    fun openUsageAccess() = act.runOnUiThread {
+        try {
+            act.startActivity(Intent(android.provider.Settings.ACTION_USAGE_ACCESS_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (e: Exception) {
+            Toast.makeText(act, "No usage access settings on this device", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Settings: wipe the learned model. It is behavioural data, so this has to be offered. */
+    @JavascriptInterface
+    fun clearPredictions() = act.predictor.clear()
 
     /** Authoritative foreground check — the UI must never "recover" while an app covers us. */
     @JavascriptInterface fun isForeground(): Boolean = act.isForeground
