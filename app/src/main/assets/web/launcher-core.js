@@ -29,8 +29,10 @@ const COLS = 15;                                        // F3 characters per ter
 // ring-band culling in rippleFx made each one cheap enough to raise this.
 const HI_SCREENS = ['settings', 'rigelsetup'];   // drawn on the 2x dot grid
 const MAX_RIPPLES = 9;
-/** How long an app suggestion offers itself before handing the widget slot back. */
-const PRED_OFFER_MS = 45000;
+/** How long an app suggestion offers itself on unlock before handing the slot back to stats. */
+const PRED_OFFER_MS = 5000;
+/** Second tap inside this window means "dismiss", not "open it twice". */
+const PRED_DBLTAP_MS = 280;
 const MID_L = 6;
 const MID_R = 61;
 // Boot: the home screen assembles out of scattered dots in BOOT_ARRANGE_MS and is live from
@@ -224,6 +226,9 @@ class Launcher {
     // per frame — the model is cheap but not free, and the answer only moves on the hour.
     this.pred = null;
     this.predShownAt = 0;                                // when the current guess started offering
+    this.predDismissedPkg = '';                          // double-tapped away, until it changes
+    this.predTapAt = 0;                                  // first tap of a possible double tap
+    this.predTapTimer = null;
     this.lastWifi = false;
     this.lastBt = false;
     this.lastData = false;
@@ -916,13 +921,50 @@ class Launcher {
     // stops asking after a while and hands the slot back, rather than sitting there for
     // hours being ignored.
     if (p && (arrived || p.pkg !== was)) this.predShownAt = Date.now();
+    // A dismissal applies to the guess you dismissed, not to the feature: once the model
+    // moves on to a different app, that new suggestion is allowed to ask.
+    if (p && this.predDismissedPkg && p.pkg !== this.predDismissedPkg) this.predDismissedPkg = '';
     if ((p && p.pkg) !== was) this.lastKey = null;
   }
 
-  /** Is there a suggestion worth giving the widget slot to right now? */
-  predShowing() {
+  /**
+   * Is there a suggestion worth giving the widget slot to at time `A`? Takes the timestamp
+   * rather than reading the clock so nextWakeMs can probe it forward — it schedules the next
+   * redraw by asking keyFor what the screen looks like in the future, and a predShowing that
+   * always answered "now" would hide the 5s expiry from it and leave the revert up to the
+   * once-a-second fallback tick.
+   */
+  predShowing(A) {
     if (!this.pred || !this.pred.pkg) return false;
-    return Date.now() - this.predShownAt < PRED_OFFER_MS;
+    if (this.pred.pkg === this.predDismissedPkg) return false;
+    return (A || Date.now()) - this.predShownAt < PRED_OFFER_MS;
+  }
+
+  /**
+   * One tap opens the suggestion, two dismisses it. The open is held for [PRED_DBLTAP_MS]
+   * so the second tap still has somewhere to land — unnoticeable next to the launch
+   * animation that follows, and the alternative (dismiss on a long press) is already taken
+   * by mini-RIGEL.
+   */
+  predTap() {
+    const now = Date.now();
+    if (this.predTapTimer && now - this.predTapAt < PRED_DBLTAP_MS) {
+      clearTimeout(this.predTapTimer);
+      this.predTapTimer = null;
+      this.predDismissedPkg = this.pred ? this.pred.pkg : '';
+      if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
+      this.lastKey = null;
+      return;
+    }
+    this.predTapAt = now;
+    const target = this.pred;
+    this.predTapTimer = setTimeout(() => {
+      this.predTapTimer = null;
+      // Re-check: the offer can expire, or the model move on, inside the double-tap window.
+      if (this.pred && target && this.pred.pkg === target.pkg && this.predShowing()) {
+        this.open('pkg:' + target.pkg, target.label);
+      }
+    }, PRED_DBLTAP_MS);
   }
 
   /** Live spectrum from AudioCapture (Visualizer on the output mix). */
@@ -1202,7 +1244,7 @@ class Launcher {
         st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
         st.wifi, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
         st.cpu, st.ram, this.gpuLoad, !!this.activeEvent, this.eventQueue.length,
-        this.predShowing() ? this.pred.pkg : '',         // app suggestion (static once drawn)
+        this.predShowing(A) ? this.pred.pkg : '',        // app suggestion (static once drawn)
         this.battWarn() && A % 1000 < 620,               // low-battery blink phase
         Math.floor(A / 500) % 2,                         // dock cursor, phase-locked to the colon
         this.appCaching(A) ? Math.floor(A / 70) % 12 : 0,     // app-cache throbber
@@ -1458,10 +1500,10 @@ class Launcher {
           if (this.bridge.voiceStop) this.bridge.voiceStop();
         }
       }]);
-    } else if (this.predShowing() && this.midKindNow === 'pred:' + this.pred.pkg) {
+    } else if (this.predShowing(A) && this.midKindNow === 'pred:' + this.pred.pkg) {
       // Only armed once the widget has actually settled on the suggestion, so the tap cannot
       // land on a guess that is still morphing in from whatever was there before.
-      this.hits.push([MID_L, midTop, MID_R, midBot, () => this.open('pkg:' + this.pred.pkg, this.pred.label)]);
+      this.hits.push([MID_L, midTop, MID_R, midBot, () => this.predTap()]);
     }
 
     // Transport glyphs are drawn by composeMiddle so they morph with the widget; only the
@@ -1578,7 +1620,7 @@ class Launcher {
     if (this.status.playing) return this.status.btAudio ? 'btaudio' : 'wave';
     if (this.status.charging) return 'charge';
     if (this.battWarn()) return 'lowbatt';
-    if (this.predShowing()) return 'pred:' + this.pred.pkg;
+    if (this.predShowing(A)) return 'pred:' + this.pred.pkg;
     if (this.config.sysStats) return 'sys';
     return 'ctx:' + this.context(A).glyph;
   }
@@ -1650,7 +1692,7 @@ class Launcher {
       this.drawCharging(g, A, cy);
     } else if (this.battWarn()) {
       this.drawLowBattery(g, A, cy);
-    } else if (this.predShowing()) {
+    } else if (this.predShowing(A)) {
       this.drawPrediction(g, A, cy);
     } else if (this.config.sysStats) {
       this.drawSystemStats(g, A, cy);
