@@ -107,6 +107,13 @@ class Voice(
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                 // Ask to stay local even on the generic recogniser where the flag is honoured.
                 if (Build.VERSION.SDK_INT >= 23) putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                // None of these were set before, so the recogniser fell back to its own short
+                // default pause-length and ended listening on an ordinary breath mid-sentence.
+                // 5 minutes effectively disables the silence cutoff; stop() (hold-to-dismiss)
+                // is still how a turn actually ends.
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 300000L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 300000L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 300000L)
             }
             recognizer?.startListening(i)
             listening = true
