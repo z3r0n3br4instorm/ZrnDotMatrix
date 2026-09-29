@@ -453,6 +453,10 @@ class AppPredictor(private val act: MainActivity) {
                 for (to in o.keys()) m[to] = o.getDouble(to)
                 transitions[from] = m
             }
+            val pp = root.optString("pendPkg", "")
+            val ps = root.optInt("pendSlot", -1)
+            val pa = root.optLong("pendAt", 0L)
+            if (pp.isNotEmpty() && ps >= 0 && pa > 0) pending = Pending(pp, ps, pa)
             val bi = root.optJSONObject("bias") ?: JSONObject()
             for (pkg in bi.keys()) {
                 val o = bi.getJSONObject(pkg)
@@ -494,7 +498,14 @@ class AppPredictor(private val act: MainActivity) {
                 .put("lastEventTs", lastEventTs)
                 .put("lastDecayDay", lastDecayDay)
                 .put("lastPkg", lastPkg ?: "")
-                .put("apps", apps).put("trans", tr).put("bias", bi).toString())
+                .put("apps", apps).put("trans", tr).put("bias", bi)
+                // The outstanding bet outlives the process on purpose: the launcher is
+                // routinely killed while you are inside the very app that would answer it,
+                // and a verdict lost to that is a verdict the model never learns from.
+                .put("pendPkg", pending?.pkg ?: "")
+                .put("pendSlot", pending?.slot ?: -1)
+                .put("pendAt", pending?.at ?: 0L)
+                .toString())
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "save failed: ${e.message}")
         }
