@@ -260,7 +260,21 @@ class AppPredictor(private val act: MainActivity) {
      */
     private fun formHypothesis() {
         val best = bestCandidate() ?: return
-        pending = Pending(best.pkg, slotOf(System.currentTimeMillis()), System.currentTimeMillis())
+        placeBet(best.pkg)
+    }
+
+    /**
+     * Records the bet, but never on top of one that is still owed an answer. predict() runs
+     * from the UI as soon as the app list lands, which can easily beat the ingest that would
+     * have graded the previous bet — overwriting it there meant the verdict was discarded
+     * before it could be read, and the correction term never moved at all.
+     */
+    private fun placeBet(pkg: String) {
+        val now = System.currentTimeMillis()
+        val open = pending
+        if (open != null && now - open.at <= REWARD_WINDOW_MS) return   // still awaiting a verdict
+        pending = Pending(pkg, slotOf(now), now)
+        saveAsync()
     }
 
     // ---- prediction -------------------------------------------------------------------------
@@ -287,8 +301,7 @@ class AppPredictor(private val act: MainActivity) {
             // record() grades it against whatever gets opened next. Written out immediately
             // (off-thread): the launcher is usually killed between placing the bet and seeing
             // it answered, so a bet only held in memory is one the model never learns from.
-            pending = Pending(best.pkg, slotOf(System.currentTimeMillis()), System.currentTimeMillis())
-            saveAsync()
+            placeBet(best.pkg)
             JSONObject()
                 .put("pkg", best.pkg)
                 .put("label", best.label)

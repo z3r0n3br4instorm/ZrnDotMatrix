@@ -332,7 +332,7 @@ class MainActivity : ComponentActivity() {
         // Coming back to the launcher is exactly when a session just ended, so this is the
         // moment there is new usage data to fold in. Rate-limited internally; off the UI
         // thread because a first run walks a month of events.
-        if (::predictor.isInitialized) Thread { predictor.refresh() }.start()
+        if (::predictor.isInitialized) Thread { predictor.refresh(5_000L) }.start()
         val wakeOwed = screenWasOff || keyguardLocked()
         js("ZL.resume($wakeOwed)")
         if (!wakeOwed) revealUi()
