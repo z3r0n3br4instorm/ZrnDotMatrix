@@ -2,6 +2,8 @@ package lab.zerone.launcher
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.AlertDialog
+import android.app.role.RoleManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -10,6 +12,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.View
 import android.view.WindowManager
 import android.webkit.ConsoleMessage
@@ -89,6 +92,7 @@ class MainActivity : ComponentActivity() {
             wakeLog("cover down")
         }
         js("ZL.uiShown()")
+        checkDefaultHome()
     }
 
     /**
@@ -243,6 +247,79 @@ class MainActivity : ComponentActivity() {
             override fun handleOnBackPressed() { js("ZL.back()") }
         })
         askPermissions()
+        web.postDelayed({ checkDefaultHome() }, 1000)
+    }
+
+    private var hasPromptedHome = false
+
+    fun isDefaultHome(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val rm = getSystemService(RoleManager::class.java)
+                if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME)) {
+                    return rm.isRoleHeld(RoleManager.ROLE_HOME)
+                }
+            }
+            val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            val resolveInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                packageManager.resolveActivity(
+                    intent,
+                    PackageManager.ResolveInfoFlags.of(PackageManager.MATCH_DEFAULT_ONLY.toLong())
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+            }
+            val currentPkg = resolveInfo?.activityInfo?.packageName
+            currentPkg == packageName
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    fun requestSetDefaultHome() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val rm = getSystemService(RoleManager::class.java)
+                if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME)) {
+                    @Suppress("DEPRECATION")
+                    startActivity(rm.createRequestRoleIntent(RoleManager.ROLE_HOME))
+                    return
+                }
+            }
+            val intent = Intent(Settings.ACTION_HOME_SETTINGS)
+            startActivity(intent)
+        } catch (e: Exception) {
+            try {
+                val intent = Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)
+                startActivity(intent)
+            } catch (_: Exception) {
+                try {
+                    val intent = Intent(Intent.ACTION_MAIN).apply {
+                        addCategory(Intent.CATEGORY_HOME)
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    }
+                    startActivity(Intent.createChooser(intent, "Set as home"))
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun checkDefaultHome() {
+        if (hasPromptedHome || isFinishing || isDestroyed) return
+        if (isDefaultHome()) return
+        hasPromptedHome = true
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            AlertDialog.Builder(this, android.R.style.Theme_Material_Dialog_Alert)
+                .setTitle("Set as home ?")
+                .setMessage("Zerone Launcher is not currently set as your default home app.")
+                .setPositiveButton("Set as home") { _, _ ->
+                    requestSetDefaultHome()
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
     }
 
     fun checkNotificationAccess(): Boolean {
@@ -306,6 +383,7 @@ class MainActivity : ComponentActivity() {
         status.push()
         syncAudioCapture()
         Bridge.location(this)?.let { js("ZL.location(${it.first},${it.second})") }
+        checkDefaultHome()
     }
 
     override fun onNewIntent(intent: Intent) {

@@ -181,6 +181,15 @@ class Bridge(private val act: MainActivity) {
     /** Authoritative foreground check — the UI must never "recover" while an app covers us. */
     @JavascriptInterface fun isForeground(): Boolean = act.isForeground
 
+    /** Checks whether Zerone is currently set as the default home app. */
+    @JavascriptInterface fun isDefaultHome(): Boolean = act.isDefaultHome()
+
+    /** Requests system to set Zerone as default home launcher. */
+    @JavascriptInterface fun requestSetDefaultHome() = act.runOnUiThread { act.requestSetDefaultHome() }
+
+    /** Triggers the 'Set as home ?' prompt dialog if not currently default. */
+    @JavascriptInterface fun checkDefaultHome() = act.runOnUiThread { act.checkDefaultHome() }
+
     /**
      * Opens RIGEL's bootstrap in a *visible* Termux session so the user can paste an API
      * key. RUN_COMMAND's normal background mode has no tty, and a launcher cannot write
@@ -335,6 +344,7 @@ class Bridge(private val act: MainActivity) {
 
     @JavascriptInterface fun haptic() = act.runOnUiThread { act.haptics.tick(1.0f) }
 
+    @JavascriptInterface fun hasHaptics(): Boolean = act.haptics.hasVibrator
     @JavascriptInterface fun isPreciseHaptics(): Boolean = act.haptics.isPreciseHapticsSupported
     @JavascriptInterface fun hapticRipple() = act.haptics.ripple()
     @JavascriptInterface fun hapticTransition() = act.haptics.transition()

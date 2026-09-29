@@ -1427,7 +1427,7 @@ class Launcher {
       }
     });
     g.text3c('ZrnDotMatrix', 33.5, top + 10, 1);
-    const ver = this.bridge.version ? this.bridge.version() : 'v0.2.1.dev.1';
+    const ver = this.bridge.version ? this.bridge.version() : 'v0.2.1.Dev.2';
     g.text3c(ver, 33.5, top + 17, 3);
   }
 
@@ -2169,6 +2169,11 @@ class Launcher {
       g.text3c(label, (c0 + c1) / 2, y + 4, tint === 9 ? 9 : 1);
       this.hits.push([c0, y, c1, y + 12, act]);
     };
+
+    const isHome = this.bridge.isDefaultHome ? this.bridge.isDefaultHome() : true;
+    if (!isHome) {
+      btn(16, 120, 32, 'SET AS DEFAULT HOME', 1, () => this.bridge.requestSetDefaultHome());
+    }
 
     const rowA = 48;
     btn(16, 66, rowA, this.status.playing ? 'STOP DEMO' : 'TEST AUDIO', 3, () => {

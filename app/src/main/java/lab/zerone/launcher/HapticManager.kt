@@ -15,10 +15,12 @@ import android.provider.Settings
  * When the device has a precise haptic motor (LRA / Linear Resonant Actuator supporting
  * amplitude control or API 30+ composition primitives), it plays micro-ticks during
  * ripple shockwaves and dot transition animations.
- * On legacy devices with imprecise ERM motors (no amplitude control / no primitives),
- * it remains silent to prevent distracting or harsh buzzing.
+ * On legacy devices without advanced haptic APIs (imprecise ERM motors, no amplitude control,
+ * or no composition primitives), it emulates the advanced features using legacy waveforms
+ * with tuned timing, interval acceleration, and pulse-width shaping.
  */
 class HapticManager(private val context: Context) {
+
 
     private val vibrator: Vibrator? = try {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -76,11 +78,18 @@ class HapticManager(private val context: Context) {
         false
     }
 
+    /** True if the device has a physical vibrator motor. */
+    val hasVibrator: Boolean = try {
+        vibrator?.hasVibrator() == true
+    } catch (e: Throwable) {
+        false
+    }
+
     /**
      * True ONLY if the device has a precision haptic actuator (e.g. LRA) capable of
      * subtle micro-ticks via composition primitives or amplitude control.
      */
-    val isPreciseHapticsSupported: Boolean = (vibrator?.hasVibrator() == true) &&
+    val isPreciseHapticsSupported: Boolean = hasVibrator &&
             (supportsTick || supportsLowTick || hasAmplitude)
 
     private val touchAttributes: Any? = when {
@@ -137,38 +146,49 @@ class HapticManager(private val context: Context) {
      * Plays tiny decaying vibrations matching the ripple effect shockwave expanding outward.
      */
     fun ripple() {
-        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        if (muted || !hasVibrator || vibrator == null || !isHapticFeedbackEnabled()) return
         val now = SystemClock.uptimeMillis()
         if (now - lastRippleTime < 40) return
         lastRippleTime = now
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
-                val primaryPrimitive = if (supportsLowTick) {
-                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
-                } else {
-                    VibrationEffect.Composition.PRIMITIVE_TICK
-                }
-                val leadPrimitive = if (supportsTick) {
-                    VibrationEffect.Composition.PRIMITIVE_TICK
-                } else {
-                    primaryPrimitive
-                }
+            if (isPreciseHapticsSupported) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
+                    val primaryPrimitive = if (supportsLowTick) {
+                        VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                    } else {
+                        VibrationEffect.Composition.PRIMITIVE_TICK
+                    }
+                    val leadPrimitive = if (supportsTick) {
+                        VibrationEffect.Composition.PRIMITIVE_TICK
+                    } else {
+                        primaryPrimitive
+                    }
 
-                val effect = VibrationEffect.startComposition()
-                    .addPrimitive(leadPrimitive, p(0.38f), 0)
-                    .addPrimitive(primaryPrimitive, p(0.28f), 65)
-                    .addPrimitive(primaryPrimitive, p(0.20f), 70)
-                    .addPrimitive(primaryPrimitive, p(0.14f), 75)
-                    .addPrimitive(primaryPrimitive, p(0.08f), 80)
-                    .compose()
-                vibrateEffect(effect)
-            } else if (hasAmplitude) {
-                // Micro-pulses of 8ms with decaying amplitude
-                val timings = longArrayOf(0, 8, 57, 8, 62, 8, 67, 8, 72, 8)
-                val amplitudes = intArrayOf(0, amp(40), 0, amp(28), 0, amp(20), 0, amp(14), 0, amp(8))
-                val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
-                vibrateEffect(effect)
+                    val effect = VibrationEffect.startComposition()
+                        .addPrimitive(leadPrimitive, p(0.38f), 0)
+                        .addPrimitive(primaryPrimitive, p(0.28f), 65)
+                        .addPrimitive(primaryPrimitive, p(0.20f), 70)
+                        .addPrimitive(primaryPrimitive, p(0.14f), 75)
+                        .addPrimitive(primaryPrimitive, p(0.08f), 80)
+                        .compose()
+                    vibrateEffect(effect)
+                } else if (hasAmplitude) {
+                    // Micro-pulses of 8ms with decaying amplitude
+                    val timings = longArrayOf(0, 8, 57, 8, 62, 8, 67, 8, 72, 8)
+                    val amplitudes = intArrayOf(0, amp(40), 0, amp(28), 0, amp(20), 0, amp(14), 0, amp(8))
+                    val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
+                    vibrateEffect(effect)
+                }
+            } else {
+                // Emulate decaying ripple on legacy hardware using decaying pulse lengths & widening gaps
+                val mult = intensity.coerceIn(0.5f, 1.5f)
+                val p1 = (14L * mult).toLong().coerceIn(8L, 24L)
+                val p2 = (10L * mult).toLong().coerceIn(6L, 18L)
+                val p3 = (7L * mult).toLong().coerceIn(4L, 12L)
+                val p4 = (4L * mult).toLong().coerceIn(3L, 8L)
+                val timings = longArrayOf(0, p1, 50, p2, 65, p3, 80, p4)
+                vibrateLegacy(timings)
             }
         } catch (e: Throwable) {
             // Gracefully ignore any hardware/driver error
@@ -179,34 +199,41 @@ class HapticManager(private val context: Context) {
      * Plays a cascade of delicate micro-ticks during the dot transition animation.
      */
     fun transition() {
-        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        if (muted || !hasVibrator || vibrator == null || !isHapticFeedbackEnabled()) return
         val now = SystemClock.uptimeMillis()
         if (now - lastTransitionTime < 60) return
         lastTransitionTime = now
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
-                val primitive = if (supportsTick) {
-                    VibrationEffect.Composition.PRIMITIVE_TICK
-                } else {
-                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
-                }
+            if (isPreciseHapticsSupported) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
+                    val primitive = if (supportsTick) {
+                        VibrationEffect.Composition.PRIMITIVE_TICK
+                    } else {
+                        VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                    }
 
-                val effect = VibrationEffect.startComposition()
-                    .addPrimitive(primitive, p(0.18f), 0)
-                    .addPrimitive(primitive, p(0.22f), 60)
-                    .addPrimitive(primitive, p(0.26f), 65)
-                    .addPrimitive(primitive, p(0.26f), 65)
-                    .addPrimitive(primitive, p(0.22f), 65)
-                    .addPrimitive(primitive, p(0.18f), 65)
-                    .addPrimitive(primitive, p(0.14f), 70)
-                    .compose()
-                vibrateEffect(effect)
-            } else if (hasAmplitude) {
-                val timings = longArrayOf(0, 8, 52, 8, 57, 8, 57, 8, 57, 8, 57, 8, 62, 8)
-                val amplitudes = intArrayOf(0, amp(20), 0, amp(24), 0, amp(28), 0, amp(28), 0, amp(24), 0, amp(20), 0, amp(15))
-                val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
-                vibrateEffect(effect)
+                    val effect = VibrationEffect.startComposition()
+                        .addPrimitive(primitive, p(0.18f), 0)
+                        .addPrimitive(primitive, p(0.22f), 60)
+                        .addPrimitive(primitive, p(0.26f), 65)
+                        .addPrimitive(primitive, p(0.26f), 65)
+                        .addPrimitive(primitive, p(0.22f), 65)
+                        .addPrimitive(primitive, p(0.18f), 65)
+                        .addPrimitive(primitive, p(0.14f), 70)
+                        .compose()
+                    vibrateEffect(effect)
+                } else if (hasAmplitude) {
+                    val timings = longArrayOf(0, 8, 52, 8, 57, 8, 57, 8, 57, 8, 57, 8, 62, 8)
+                    val amplitudes = intArrayOf(0, amp(20), 0, amp(24), 0, amp(28), 0, amp(28), 0, amp(24), 0, amp(20), 0, amp(15))
+                    val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
+                    vibrateEffect(effect)
+                }
+            } else {
+                // Emulate transition ticks on legacy hardware with 4 brief, crisp pulses
+                val p = (7L * intensity.coerceIn(0.5f, 1.5f)).toLong().coerceIn(4L, 12L)
+                val timings = longArrayOf(0, p, 55, p, 60, p, 65, p)
+                vibrateLegacy(timings)
             }
         } catch (e: Throwable) {
             // Gracefully ignore any hardware/driver error
@@ -223,52 +250,73 @@ class HapticManager(private val context: Context) {
      * slightly — the shape of the cascade is what carries the sensation.
      */
     fun arrange(durationMs: Long) {
-        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        if (muted || !hasVibrator || vibrator == null || !isHapticFeedbackEnabled()) return
         val dur = durationMs.coerceIn(200L, 3000L)
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
-                val tick = if (supportsTick) {
-                    VibrationEffect.Composition.PRIMITIVE_TICK
-                } else {
-                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+            if (isPreciseHapticsSupported) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
+                    val tick = if (supportsTick) {
+                        VibrationEffect.Composition.PRIMITIVE_TICK
+                    } else {
+                        VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                    }
+                    val unit = if (supportsTick) tickMs else lowTickMs
+                    val comp = VibrationEffect.startComposition()
+                    var budget = dur
+                    if (supportsQuickRise) {
+                        comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE, p(0.30f), 0)
+                        budget -= quickRiseMs                    // the rise owns the head of the flight
+                    }
+                    // Landing times follow (i/n)^0.6, so the gaps shrink and the cascade accelerates.
+                    val n = (maxPrimitives - 2).coerceIn(4, 10)
+                    var prev = 0L
+                    for (i in 1..n) {
+                        val at = (budget.coerceAtLeast(120L) * Math.pow(i.toDouble() / n, 0.6)).toLong()
+                        val gap = (at - prev - unit).coerceAtLeast(0L)
+                        comp.addPrimitive(tick, p(0.10f + 0.22f * i / n.toFloat()), gap.toInt())
+                        prev = at
+                    }
+                    if (supportsClick) {
+                        comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, p(0.45f), 0)
+                    } else {
+                        comp.addPrimitive(tick, p(0.40f), 0)
+                    }
+                    vibrateEffect(comp.compose())
+                } else if (hasAmplitude) {
+                    val n = 8
+                    val t = ArrayList<Long>(n * 2 + 2)
+                    val a = ArrayList<Int>(n * 2 + 2)
+                    var prev = 0L
+                    for (i in 1..n) {
+                        val at = (dur * Math.pow(i.toDouble() / n, 0.6)).toLong()
+                        t.add((at - prev - 8L).coerceAtLeast(4L)); a.add(0)
+                        t.add(8L); a.add(amp(18 + 26 * i / n))
+                        prev = at
+                    }
+                    t.add(6L); a.add(0)
+                    t.add(14L); a.add(amp(70))                   // landing
+                    vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
                 }
-                val unit = if (supportsTick) tickMs else lowTickMs
-                val comp = VibrationEffect.startComposition()
-                var budget = dur
-                if (supportsQuickRise) {
-                    comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_QUICK_RISE, p(0.30f), 0)
-                    budget -= quickRiseMs                    // the rise owns the head of the flight
-                }
-                // Landing times follow (i/n)^0.6, so the gaps shrink and the cascade accelerates.
-                val n = (maxPrimitives - 2).coerceIn(4, 10)
+            } else {
+                // Legacy emulation: accelerating cascade of micro-pulses followed by a firm landing click
+                val pulseMs = (7L * intensity.coerceIn(0.5f, 1.5f)).toLong().coerceIn(4L, 12L)
+                val landingMs = (20L * intensity.coerceIn(0.5f, 1.5f)).toLong().coerceIn(12L, 35L)
+                val n = 5
+                val timingsList = ArrayList<Long>(n * 2 + 2)
+                timingsList.add(0L)
                 var prev = 0L
+                val flightDur = dur - landingMs - 20L
                 for (i in 1..n) {
-                    val at = (budget.coerceAtLeast(120L) * Math.pow(i.toDouble() / n, 0.6)).toLong()
-                    val gap = (at - prev - unit).coerceAtLeast(0L)
-                    comp.addPrimitive(tick, p(0.10f + 0.22f * i / n.toFloat()), gap.toInt())
+                    val at = (flightDur.coerceAtLeast(100L) * Math.pow(i.toDouble() / n, 0.6)).toLong()
+                    val gap = (at - prev - pulseMs).coerceAtLeast(20L)
+                    if (i > 1) timingsList.add(gap)
+                    timingsList.add(pulseMs)
                     prev = at
                 }
-                if (supportsClick) {
-                    comp.addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, p(0.45f), 0)
-                } else {
-                    comp.addPrimitive(tick, p(0.40f), 0)
-                }
-                vibrateEffect(comp.compose())
-            } else if (hasAmplitude) {
-                val n = 8
-                val t = ArrayList<Long>(n * 2 + 2)
-                val a = ArrayList<Int>(n * 2 + 2)
-                var prev = 0L
-                for (i in 1..n) {
-                    val at = (dur * Math.pow(i.toDouble() / n, 0.6)).toLong()
-                    t.add((at - prev - 8L).coerceAtLeast(4L)); a.add(0)
-                    t.add(8L); a.add(amp(18 + 26 * i / n))
-                    prev = at
-                }
-                t.add(6L); a.add(0)
-                t.add(14L); a.add(amp(70))                   // landing
-                vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
+                timingsList.add(15L)
+                timingsList.add(landingMs)
+                vibrateLegacy(timingsList.toLongArray())
             }
         } catch (e: Throwable) {
             // Gracefully ignore any hardware/driver error
@@ -282,36 +330,54 @@ class HapticManager(private val context: Context) {
      * no rise, no closing click, even spacing, and the gentlest primitive the motor has.
      */
     fun sweep(durationMs: Long) {
-        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        if (muted || !hasVibrator || vibrator == null || !isHapticFeedbackEnabled()) return
         val dur = durationMs.coerceIn(200L, 3000L)
 
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsLowTick || supportsTick)) {
-                val soft = if (supportsLowTick) {
-                    VibrationEffect.Composition.PRIMITIVE_LOW_TICK
-                } else {
-                    VibrationEffect.Composition.PRIMITIVE_TICK
+            if (isPreciseHapticsSupported) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsLowTick || supportsTick)) {
+                    val soft = if (supportsLowTick) {
+                        VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                    } else {
+                        VibrationEffect.Composition.PRIMITIVE_TICK
+                    }
+                    val unit = if (supportsLowTick) lowTickMs else tickMs
+                    val n = (dur / 62L).toInt().coerceIn(6, maxPrimitives)
+                    val gap = ((dur - n * unit) / (n - 1)).coerceAtLeast(0L).toInt()
+                    val comp = VibrationEffect.startComposition()
+                    for (i in 0 until n) {
+                        val bell = Math.sin(Math.PI * i / (n - 1))       // 0 → 1 → 0 across the letters
+                        comp.addPrimitive(soft, p((0.05 + 0.20 * bell).toFloat()), if (i == 0) 0 else gap)
+                    }
+                    vibrateEffect(comp.compose())
+                } else if (hasAmplitude) {
+                    val n = (dur / 62L).toInt().coerceIn(6, 24)
+                    val gap = ((dur - n * 8L) / (n - 1)).coerceAtLeast(4L)
+                    val t = ArrayList<Long>(n * 2)
+                    val a = ArrayList<Int>(n * 2)
+                    for (i in 0 until n) {
+                        val bell = Math.sin(Math.PI * i / (n - 1))
+                        t.add(if (i == 0) 0L else gap); a.add(0)
+                        t.add(8L); a.add(amp((8 + 34 * bell).toInt()))
+                    }
+                    vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
                 }
-                val unit = if (supportsLowTick) lowTickMs else tickMs
-                val n = (dur / 62L).toInt().coerceIn(6, maxPrimitives)
-                val gap = ((dur - n * unit) / (n - 1)).coerceAtLeast(0L).toInt()
-                val comp = VibrationEffect.startComposition()
+            } else {
+                // Legacy emulation: evenly spaced pulses whose pulse duration swells and fades following a sine bell curve
+                val n = (dur / 90L).toInt().coerceIn(5, 12)
+                val step = dur / n
+                val timingsList = ArrayList<Long>(n * 2)
+                timingsList.add(0L)
                 for (i in 0 until n) {
-                    val bell = Math.sin(Math.PI * i / (n - 1))       // 0 → 1 → 0 across the letters
-                    comp.addPrimitive(soft, p((0.05 + 0.20 * bell).toFloat()), if (i == 0) 0 else gap)
+                    val bell = Math.sin(Math.PI * i / (n - 1).coerceAtLeast(1))
+                    val pulseDur = ((5 + 10 * bell) * intensity.coerceIn(0.5f, 1.5f)).toLong().coerceIn(3L, 18L)
+                    if (i > 0) {
+                        val gap = (step - pulseDur).coerceAtLeast(15L)
+                        timingsList.add(gap)
+                    }
+                    timingsList.add(pulseDur)
                 }
-                vibrateEffect(comp.compose())
-            } else if (hasAmplitude) {
-                val n = (dur / 62L).toInt().coerceIn(6, 24)
-                val gap = ((dur - n * 8L) / (n - 1)).coerceAtLeast(4L)
-                val t = ArrayList<Long>(n * 2)
-                val a = ArrayList<Int>(n * 2)
-                for (i in 0 until n) {
-                    val bell = Math.sin(Math.PI * i / (n - 1))
-                    t.add(if (i == 0) 0L else gap); a.add(0)
-                    t.add(8L); a.add(amp((8 + 34 * bell).toInt()))
-                }
-                vibrateEffect(VibrationEffect.createWaveform(t.toLongArray(), a.toIntArray(), -1))
+                vibrateLegacy(timingsList.toLongArray())
             }
         } catch (e: Throwable) {
             // Gracefully ignore any hardware/driver error
@@ -322,18 +388,67 @@ class HapticManager(private val context: Context) {
      * Plays a single tiny tick vibration.
      */
     fun tick(scale: Float = 0.25f) {
-        if (muted || !isPreciseHapticsSupported || vibrator == null || !isHapticFeedbackEnabled()) return
+        if (muted || !hasVibrator || vibrator == null || !isHapticFeedbackEnabled()) return
         try {
             val clamped = p(scale)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
-                val primitive = if (supportsTick) VibrationEffect.Composition.PRIMITIVE_TICK else VibrationEffect.Composition.PRIMITIVE_LOW_TICK
-                val effect = VibrationEffect.startComposition()
-                    .addPrimitive(primitive, clamped, 0)
-                    .compose()
+            if (isPreciseHapticsSupported) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (supportsTick || supportsLowTick)) {
+                    val primitive = if (supportsTick) VibrationEffect.Composition.PRIMITIVE_TICK else VibrationEffect.Composition.PRIMITIVE_LOW_TICK
+                    val effect = VibrationEffect.startComposition()
+                        .addPrimitive(primitive, clamped, 0)
+                        .compose()
+                    vibrateEffect(effect)
+                } else if (hasAmplitude) {
+                    val effect = VibrationEffect.createOneShot(8, (clamped * 100).toInt().coerceIn(1, 255))
+                    vibrateEffect(effect)
+                }
+            } else {
+                // Legacy emulation: crisp short micro-pulse
+                val dur = (10L * (scale * intensity).coerceIn(0.5f, 1.5f)).toLong().coerceIn(5L, 20L)
+                vibrateLegacy(dur)
+            }
+        } catch (e: Throwable) {
+            // Gracefully ignore
+        }
+    }
+
+    private fun vibrateLegacy(timings: LongArray) {
+        val v = vibrator ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val effect = VibrationEffect.createWaveform(timings, -1)
                 vibrateEffect(effect)
-            } else if (hasAmplitude) {
-                val effect = VibrationEffect.createOneShot(8, (clamped * 100).toInt().coerceIn(1, 255))
+            } else {
+                @Suppress("DEPRECATION")
+                (touchAttributes as? AudioAttributes)?.let {
+                    v.vibrate(timings, -1, it)
+                    return
+                }
+                @Suppress("DEPRECATION")
+                v.vibrate(timings, -1)
+            }
+        } catch (e: Throwable) {
+            // Gracefully ignore
+        }
+    }
+
+    private fun vibrateLegacy(durationMs: Long) {
+        val v = vibrator ?: return
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val effect = VibrationEffect.createOneShot(
+                    durationMs.coerceAtLeast(1L),
+                    VibrationEffect.DEFAULT_AMPLITUDE
+                )
                 vibrateEffect(effect)
+            } else {
+                @Suppress("DEPRECATION")
+                (touchAttributes as? AudioAttributes)?.let {
+                    v.vibrate(durationMs, it)
+                    return
+                }
+                @Suppress("DEPRECATION")
+                v.vibrate(durationMs)
             }
         } catch (e: Throwable) {
             // Gracefully ignore

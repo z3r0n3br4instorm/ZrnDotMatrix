@@ -18,6 +18,27 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract Version & Tag
+        id: vars
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
+          else
+            VERSION=$(sed -n 's/.*versionName *= *"\(.*\)".*/\1/p' app/build.gradle.kts)
+            if [[ "$VERSION" =~ ^v ]]; then
+              TAG="$VERSION"
+            else
+              TAG="v$VERSION"
+            fi
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Target tag: $TAG"
+          echo "App version: $VERSION"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -48,14 +69,30 @@ jobs:
           name: ZrnDotMatrix-APKs
           path: dist/*.apk
 
+      - name: Create and Push Git Tag
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          TAG="${{ steps.vars.outputs.tag }}"
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Creating and pushing tag $TAG"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "Release $TAG"
+            git push origin "$TAG" || true
+          else
+            echo "Tag $TAG already exists"
+          fi
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'latest' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'ZrnDotMatrix Latest Build' }}
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: ZrnDotMatrix ${{ steps.vars.outputs.tag }}
           body: |
-            Automated continuous deployment build for ZrnDotMatrix (ZERONE Launcher).
+            Automated release build for ZrnDotMatrix (ZERONE Launcher).
+            
+            **Version**: ${{ steps.vars.outputs.tag }}
             
             ### Included APKs:
             - **ZrnDotMatrix-release.apk** (Optimized release build)

@@ -11,8 +11,8 @@ android {
         applicationId = "lab.zerone.launcher"
         minSdk = 21                     // Android 5.0 Lollipop (BlackBerry Priv STV100-x on 5.1.1/6.0 and friends)
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.2.1.dev.1"
+        versionCode = 5
+        versionName = "0.2.1.Dev.2"
     }
     signingConfigs {
         // CI injects a real keystore through secrets. Without them the release build falls
