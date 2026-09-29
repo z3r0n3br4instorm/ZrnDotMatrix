@@ -100,6 +100,10 @@ class AppPredictor(private val act: MainActivity) {
             decayIfNeeded(now)
             if (hasUsageAccess()) ingestUsageEvents(now)
             save()
+            // Ingest runs off the UI thread and a first pass walks a month of events, so the
+            // UI's own startup ask can easily beat it and see an empty model. Tell it when
+            // there is actually something to ask about.
+            act.js("ZL.predictionReady()")
         } catch (e: Throwable) {
             // A prediction is a nicety; never let it take the launcher down.
             android.util.Log.w(TAG, "refresh failed: ${e.message}")

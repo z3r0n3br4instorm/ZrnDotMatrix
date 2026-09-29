@@ -96,7 +96,12 @@
   // ---- calls from Android ----
   window.ZL = {
     onStatus(json) { L.onStatus(json); },
-    onApps(json) { L.onApps(json); },                       // app cache finished building
+    // The predictor resolves a package to a name through this same list, so asking it for a
+    // guess before this has landed skips every candidate and reports "nothing". Driven off
+    // the event rather than a timer — the build takes the better part of a second on a full
+    // phone, which is a race a fixed delay loses.
+    onApps(json) { L.onApps(json); L.refreshPrediction(false); },
+    predictionReady() { L.refreshPrediction(false); },      // usage-stats ingest finished
     uiShown() { L.uiShown = true; },                        // native: frame 0 composited, cover down
     onShake(mag) { if (L.onShake) L.onShake(mag); },         // accelerometer jolt, drives scenes
     onAudio(json) { L.onAudio(json); },                     // live FFT from AudioCapture
@@ -298,9 +303,8 @@
     const loc = N.location(); if (loc) { const p = loc.split(','); weather(p[0], p[1]); }
     N.ready();
     L.refreshCustomGlyphs(); L.refreshMediaGlyphs(); L.refreshScenes();
-    // The model needs the app list to resolve a package to a name, and that build is async —
-    // a first pass now would find labels empty and give up, so let it land first.
-    setTimeout(() => L.refreshPrediction(true), 1500);
+    // No first call here: ZL.onApps and ZL.predictionReady both fire one as soon as the data
+    // they depend on exists, which is strictly better than guessing a delay.
     // The guess drifts with the hour, so re-ask periodically rather than only on resume.
     setInterval(() => L.refreshPrediction(false), 5 * 60 * 1000);
   }
