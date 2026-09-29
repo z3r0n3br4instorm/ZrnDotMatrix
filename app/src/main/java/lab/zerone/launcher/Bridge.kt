@@ -47,6 +47,12 @@ class Bridge(private val act: MainActivity) {
      *  "not a launchable app" before this is true — the map is simply not populated yet. */
     fun labelsReady(): Boolean = labels.isNotEmpty()
 
+    /** Everything that can act as a home screen, us included. */
+    @Volatile private var homePkgs: Set<String> = emptySet()
+
+    /** "OPEN PIXEL LAUNCHER?" is not a useful suggestion from inside a launcher. */
+    fun isHomeApp(pkg: String): Boolean = pkg in homePkgs
+
     /** The cached list, or "[]" while the first build runs. Returns immediately, always. */
     @JavascriptInterface
     fun apps(): String {
@@ -95,6 +101,10 @@ class Bridge(private val act: MainActivity) {
         val arr = JSONArray()
         out.forEach { arr.put(JSONObject().put("label", it.first).put("pkg", it.second)) }
         labels = out.associate { it.second to it.first }
+        homePkgs = try {
+            val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            pm.queryIntentActivities(home, 0).map { it.activityInfo.packageName }.toSet()
+        } catch (e: Exception) { emptySet() }
         return arr.toString()
     }
 

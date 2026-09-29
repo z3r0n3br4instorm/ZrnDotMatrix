@@ -234,6 +234,10 @@ class AppPredictor(private val act: MainActivity) {
 
         for ((pkg, s) in stats) {
             if (s.launches < MIN_APP_LAUNCHES) continue
+            // Also filtered here, not just at ingest: a package already in the model from an
+            // earlier build — or one that became a launcher since — would otherwise keep
+            // being offered until decay finally forgot it.
+            if (ignored(pkg)) continue
             // Resolved up front, not after picking a winner: an app uninstalled since it was
             // logged should lose to the runner-up, not suppress the suggestion entirely.
             val label = act.bridge.labelFor(pkg) ?: continue
@@ -312,7 +316,9 @@ class AppPredictor(private val act: MainActivity) {
      * every event on the first pass, which is exactly the pass that carries a month of it.
      */
     private fun ignored(pkg: String): Boolean =
-        pkg == act.packageName || (act.bridge.labelsReady() && act.bridge.labelFor(pkg) == null)
+        pkg == act.packageName ||
+            act.bridge.isHomeApp(pkg) ||   // another launcher: never a useful suggestion
+            (act.bridge.labelsReady() && act.bridge.labelFor(pkg) == null)
 
     private fun slotOf(ms: Long): Int {
         val c = Calendar.getInstance()
