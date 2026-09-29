@@ -420,6 +420,25 @@ class AppPredictor(private val act: MainActivity) {
     }
 
     /**
+     * Drops anything that should never have been learned — this launcher, other home apps,
+     * packages since uninstalled. Filtering these at read time is not enough: they stay in
+     * `totalLaunches`, which is the denominator of every app's prior, so a launcher sitting on
+     * a tenth of all recorded launches quietly deflates the score of every real candidate.
+     * Guarded on labelsReady so an empty label map cannot be read as "nothing is launchable"
+     * and wipe the model.
+     */
+    private fun purgeIgnored() {
+        if (!act.bridge.labelsReady()) return
+        val dead = stats.keys.filter { ignored(it) }
+        if (dead.isEmpty()) return
+        val deadSet = dead.toSet()
+        for (p in dead) { stats.remove(p); transitions.remove(p); bias.remove(p) }
+        for (m in transitions.values) m.keys.removeAll(deadSet)
+        pending?.let { if (it.pkg in deadSet) pending = null }
+        android.util.Log.d(TAG, "purged ${dead.size} untrackable: ${dead.take(4)}")
+    }
+
+    /**
      * Skip ourselves and anything with no launcher entry — services, IMEs, system UI.
      * The label map is built asynchronously, so "not in the map" only means "not launchable"
      * once it has actually been built; treating an empty map as authoritative would discard
