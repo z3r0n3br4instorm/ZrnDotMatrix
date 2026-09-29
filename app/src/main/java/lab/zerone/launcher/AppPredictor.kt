@@ -56,6 +56,22 @@ class AppPredictor(private val act: MainActivity) {
     /** prev package -> next package -> dwell-weighted count. "What usually follows X." */
     private val transitions = ConcurrentHashMap<String, ConcurrentHashMap<String, Double>>()
 
+    /**
+     * Learned correction per package per time slot, added straight to the score.
+     *
+     * This is the reinforcement part, and it is a contextual bandit rather than anything
+     * deeper: the slot is the context, naming one app is the action, and what you open next
+     * is the reward. Counting alone cannot represent "you open this constantly but never the
+     * time I offer it" — the counts say it is popular either way. A signed term that only
+     * moves when a guess is graded can, and it moves fast, because a handful of corrections
+     * should visibly change behaviour rather than being averaged into thousands of launches.
+     */
+    private val bias = ConcurrentHashMap<String, ConcurrentHashMap<Int, Double>>()
+
+    /** The guess currently awaiting a verdict: what was named, in which slot, and when. */
+    private class Pending(val pkg: String, val slot: Int, val at: Long)
+    @Volatile private var pending: Pending? = null
+
     @Volatile private var lastEventTs = 0L
     @Volatile private var lastDecayDay = 0L
     @Volatile private var loaded = false
@@ -99,6 +115,10 @@ class AppPredictor(private val act: MainActivity) {
             ensureLoaded()
             decayIfNeeded(now)
             if (hasUsageAccess()) ingestUsageEvents(now)
+            // Ingest first, then commit to a guess for the period ahead. Runs whether or not
+            // the widget is on — with it off this is the only thing keeping the reinforcement
+            // loop alive, which is the point of "keep learning in the background".
+            formHypothesis()
             save()
             // Ingest runs off the UI thread and a first pass walks a month of events, so the
             // UI's own startup ask can easily beat it and see an empty model. Tell it when
@@ -178,6 +198,7 @@ class AppPredictor(private val act: MainActivity) {
     private fun record(pkg: String, startedAt: Long, durationMs: Long, prev: String?) {
         val weight = min(1.0, durationMs.toDouble() / FULL_WEIGHT_MS)
         if (weight < MIN_WEIGHT) return
+        grade(pkg, startedAt)
         val st = stats.getOrPut(pkg) { Stat() }
         st.launches += weight
         st.totalMs += durationMs
@@ -188,6 +209,49 @@ class AppPredictor(private val act: MainActivity) {
             val m = transitions.getOrPut(prev) { ConcurrentHashMap() }
             m[pkg] = (m[pkg] ?: 0.0) + weight
         }
+    }
+
+    // ---- reinforcement ------------------------------------------------------------------------
+
+    /**
+     * Grades the outstanding guess against what you actually opened. Called from [record], so
+     * it sees launches from both sources — including ones made outside this launcher entirely.
+     *
+     * Rewarding the app you chose matters as much as penalising the one that was named: the
+     * whole failure mode is a popular app crowding out the right one in a slot it owns, and
+     * only a positive term on the chosen app fixes that. Both are clamped so a run of unusual
+     * days can bend the ranking without overwriting what the counts know.
+     */
+    private fun grade(launched: String, at: Long) {
+        val p = pending ?: return
+        val dt = at - p.at
+        // Outside the window this is just the next thing you happened to do, not an answer.
+        if (dt < 0 || dt > REWARD_WINDOW_MS) { if (dt > REWARD_WINDOW_MS) pending = null; return }
+        pending = null
+        if (launched == p.pkg) {
+            nudge(p.pkg, p.slot, ACCEPT_LR)
+        } else {
+            nudge(p.pkg, p.slot, -REJECT_LR)
+            nudge(launched, p.slot, ALT_LR)
+        }
+    }
+
+    private fun nudge(pkg: String, slot: Int, delta: Double) {
+        val m = bias.getOrPut(pkg) { ConcurrentHashMap() }
+        val v = (m[slot] ?: 0.0) + delta
+        m[slot] = v.coerceIn(-BIAS_CLAMP, BIAS_CLAMP)
+    }
+
+    private fun biasOf(pkg: String, slot: Int): Double = bias[pkg]?.get(slot) ?: 0.0
+
+    /**
+     * Forms a guess without showing one, so the loop keeps turning while the widget is off:
+     * the model still commits to an answer and still gets graded on it. Turning the widget
+     * back on then gets a predictor that has been learning all along, not one starting cold.
+     */
+    private fun formHypothesis() {
+        val best = bestCandidate() ?: return
+        pending = Pending(best.pkg, slotOf(System.currentTimeMillis()), System.currentTimeMillis())
     }
 
     // ---- prediction -------------------------------------------------------------------------
@@ -206,6 +270,9 @@ class AppPredictor(private val act: MainActivity) {
             android.util.Log.d(TAG, if (best == null) "no candidate (apps=${stats.size})"
                        else "suggest ${best.pkg} score=${"%.2f".format(best.score)}")
             if (best == null) return "{}"
+            // Naming an app IS the action the policy took, so this is where the bet is placed;
+            // record() grades it against whatever gets opened next.
+            pending = Pending(best.pkg, slotOf(System.currentTimeMillis()), System.currentTimeMillis())
             JSONObject()
                 .put("pkg", best.pkg)
                 .put("label", best.label)
@@ -268,7 +335,9 @@ class AppPredictor(private val act: MainActivity) {
                 ln(((fromLast?.get(pkg) ?: 0.0) + TRANS_ALPHA) / (fromLastTotal + TRANS_ALPHA * stats.size))
             } else 0.0
 
-            var score = W_PRIOR * prior + W_SLOT * pSlot + W_TRANS * trans
+            // The learned correction is added raw, not weighted: it is already in score units
+            // and is the one term that reflects your verdict rather than your history.
+            var score = W_PRIOR * prior + W_SLOT * pSlot + W_TRANS * trans + biasOf(pkg, slot)
 
             // Cheap contextual nudges from state the launcher already tracks. Headphones or a
             // Bluetooth speaker going live is the single most predictive non-temporal signal
@@ -314,6 +383,15 @@ class AppPredictor(private val act: MainActivity) {
         for (m in transitions.values) {
             for ((k, v) in m) m[k] = v * f
             m.entries.removeAll { it.value < FORGET_BELOW || !stats.containsKey(it.key) }
+        }
+        // Corrections fade faster than counts. A verdict is about how things are now, and a
+        // penalty earned months ago should not still be suppressing an app you have since
+        // started using — the counts are the long memory, this is the short one.
+        val bf = Math.pow(BIAS_DECAY, days.toDouble())
+        for ((pkg, m) in bias) {
+            for ((k, v) in m) m[k] = v * bf
+            m.entries.removeAll { kotlin.math.abs(it.value) < BIAS_FORGET }
+            if (m.isEmpty() || !stats.containsKey(pkg)) bias.remove(pkg)
         }
         lastDecayDay = day
     }
@@ -375,6 +453,13 @@ class AppPredictor(private val act: MainActivity) {
                 for (to in o.keys()) m[to] = o.getDouble(to)
                 transitions[from] = m
             }
+            val bi = root.optJSONObject("bias") ?: JSONObject()
+            for (pkg in bi.keys()) {
+                val o = bi.getJSONObject(pkg)
+                val m = ConcurrentHashMap<Int, Double>()
+                for (k in o.keys()) m[k.toInt()] = o.getDouble(k)
+                bias[pkg] = m
+            }
         } catch (e: Throwable) {
             // A corrupt model is not worth a crash or a migration path — start over.
             android.util.Log.w(TAG, "model unreadable, starting fresh: ${e.message}")
@@ -399,11 +484,17 @@ class AppPredictor(private val act: MainActivity) {
                 for ((to, v) in m) o.put(to, v)
                 tr.put(from, o)
             }
+            val bi = JSONObject()
+            for ((pkg, m) in bias) {
+                val o = JSONObject()
+                for ((slot, v) in m) o.put(slot.toString(), v)
+                bi.put(pkg, o)
+            }
             file.writeText(JSONObject()
                 .put("lastEventTs", lastEventTs)
                 .put("lastDecayDay", lastDecayDay)
                 .put("lastPkg", lastPkg ?: "")
-                .put("apps", apps).put("trans", tr).toString())
+                .put("apps", apps).put("trans", tr).put("bias", bi).toString())
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "save failed: ${e.message}")
         }
@@ -411,8 +502,8 @@ class AppPredictor(private val act: MainActivity) {
 
     /** Settings "forget everything" — the model is behavioural data, so this has to exist. */
     fun clear() {
-        stats.clear(); transitions.clear()
-        lastEventTs = 0L; lastDecayDay = 0L; lastPkg = null
+        stats.clear(); transitions.clear(); bias.clear()
+        lastEventTs = 0L; lastDecayDay = 0L; lastPkg = null; pending = null
         try { file.delete() } catch (e: Throwable) {}
     }
 
@@ -450,6 +541,18 @@ class AppPredictor(private val act: MainActivity) {
 
         private const val DAILY_DECAY = 0.985            // ~46-day half-life
         private const val FORGET_BELOW = 0.05
+
+        // Reinforcement. Rates are deliberately large next to the counts: a few corrections
+        // should visibly move the ranking, which is the entire point of grading the guess
+        // rather than just counting launches. Accept outweighs reject so the model is not
+        // talked out of a good habit by one distracted morning.
+        private const val REWARD_WINDOW_MS = 90_000L     // a launch this soon is an answer
+        private const val ACCEPT_LR = 0.60               // named it, you opened it
+        private const val REJECT_LR = 0.35               // named it, you opened something else
+        private const val ALT_LR = 0.25                  // ...and what you opened instead
+        private const val BIAS_CLAMP = 2.5               // never allowed to overrule the counts
+        private const val BIAS_DECAY = 0.94              // ~11-day half-life: shorter memory
+        private const val BIAS_FORGET = 0.02
 
         private val MEDIA_HINTS = listOf(
             "music", "spotify", "audio", "podcast", "player", "youtube", "soundcloud", "deezer"

@@ -63,7 +63,7 @@
     clearPredictions: () => { if (N && N.clearPredictions) N.clearPredictions(); },
     getConfig: () => {
       const defaults = {
-        launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true,
+        launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true, appSuggest: true,
         haptics: true, hapticLevel: 'med', agentic: 'agy', amoled: false, speak: false, streamRigel: true, musicApp: 'auto', chatApp: 'auto',
         bootSeed: 'random'          // where the boot dots come from: 'random' or 'fp'
       };

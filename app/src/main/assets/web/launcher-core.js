@@ -217,7 +217,7 @@ class Launcher {
     this.weather = { kind: null, temp: null };
     this.lastKey = null;
     this.config = this.bridge.getConfig ? this.bridge.getConfig() : {
-      launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true, haptics: true,
+      launchDelay: 800, termuxMode: 'app', sysStats: true, eventBanners: true, appSuggest: true, haptics: true,
       dockCam: 'auto', dockWeb: 'auto', dockTerm: 'auto', dockChat: 'auto', dockMusic: 'auto'
     };
     this.eventQueue = [];
@@ -942,6 +942,9 @@ class Launcher {
    * once-a-second fallback tick.
    */
   predShowing(A) {
+    // Display gate only — refreshPrediction still runs, so the model keeps forming guesses
+    // and keeps being graded on them while this is off.
+    if (this.config.appSuggest === false) return false;
     if (!this.pred || !this.pred.pkg) return false;
     if (this.pred.pkg === this.predDismissedPkg) return false;
     const elapsed = (A || Date.now()) - this.predShownAt;
@@ -2024,6 +2027,12 @@ class Launcher {
       }},
       { label: 'SYSTEM STATS', val: this.config.sysStats ? 'ON' : 'OFF', toggle: () => {
         this.config.sysStats = !this.config.sysStats;
+      }},
+      // Hides the widget only. The model keeps ingesting launches and keeps grading its own
+      // guesses against what you actually opened, so turning this back on gets a predictor
+      // that has been learning the whole time rather than one starting from cold.
+      { label: 'APP SUGGEST', val: this.config.appSuggest !== false ? 'ON' : 'OFF', toggle: () => {
+        this.config.appSuggest = this.config.appSuggest === false ? true : false;
       }},
       { label: 'EVENT BANNERS', val: this.config.eventBanners ? 'ON' : 'OFF', toggle: () => {
         this.config.eventBanners = !this.config.eventBanners;
