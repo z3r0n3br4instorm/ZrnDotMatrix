@@ -208,7 +208,7 @@ class AppPredictor(private val act: MainActivity) {
             // that is exact and immediate — the user pressed the thing — whereas UsageStats
             // events surface on the system's own schedule, which can be well after the fact.
             // Grading only touches the correction term, so it never double-counts.
-            grade(pkg, nowMs)
+            grade(pkg, nowMs, true)
             if (hasUsageAccess()) { lastPkg = pkg; saveAsync(); return }
             val now = nowMs
             record(pkg, now, ASSUMED_SESSION_MS, lastPkg)
@@ -226,8 +226,13 @@ class AppPredictor(private val act: MainActivity) {
      */
     private fun record(pkg: String, startedAt: Long, durationMs: Long, prev: String?) {
         val weight = min(1.0, durationMs.toDouble() / FULL_WEIGHT_MS)
+        // Graded before the dwell gate, not after. Opening something for two seconds is a poor
+        // sample of what you use, which is why it does not count toward the histogram — but it
+        // is a perfectly clear statement that you did not want what was offered, and that is a
+        // different question. Gating the verdict on dwell meant a guess you visibly declined
+        // was thrown away along with the session.
+        grade(pkg, startedAt, weight >= MIN_WEIGHT)
         if (weight < MIN_WEIGHT) return
-        grade(pkg, startedAt)
         val st = stats.getOrPut(pkg) { Stat() }
         st.launches += weight
         st.totalMs += durationMs
@@ -251,17 +256,21 @@ class AppPredictor(private val act: MainActivity) {
      * only a positive term on the chosen app fixes that. Both are clamped so a run of unusual
      * days can bend the ranking without overwriting what the counts know.
      */
-    private fun grade(launched: String, at: Long) {
+    private fun grade(launched: String, at: Long, substantial: Boolean) {
         val p = pending ?: return
         val dt = at - p.at
         // Outside the window this is just the next thing you happened to do, not an answer.
         if (dt < 0 || dt > REWARD_WINDOW_MS) { if (dt > REWARD_WINDOW_MS) pending = null; return }
         pending = null
         if (launched == p.pkg) {
-            nudge(p.pkg, p.slot, ACCEPT_LR)
+            // Taking the suggestion and bouncing straight back out is not an endorsement.
+            if (substantial) nudge(p.pkg, p.slot, ACCEPT_LR)
         } else {
+            // The penalty always lands: whatever you did instead, you did not want this one.
             nudge(p.pkg, p.slot, -REJECT_LR)
-            nudge(launched, p.slot, ALT_LR)
+            // The credit does not, unless you actually stayed — otherwise a mis-tap on the way
+            // somewhere else teaches the model to offer the thing you mis-tapped.
+            if (substantial) nudge(launched, p.slot, ALT_LR)
         }
     }
 

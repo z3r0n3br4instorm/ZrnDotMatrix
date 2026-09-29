@@ -32,6 +32,9 @@ import java.util.Locale
 /** Battery, charging, Wi-Fi, Bluetooth, mobile data, CPU, RAM, media playback, headphones, signal and next alarm → JSON for the UI. */
 class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit) {
 
+    /** Wi-Fi tether interfaces, minus wlan0 — see hotspotOn. */
+    private val TETHER_IFACE = Regex("^(ap_br_|softap|wlan[1-9])")
+
     private val main = Handler(Looper.getMainLooper())
     private val cm = (ContextCompat.getSystemService(ctx, ConnectivityManager::class.java)
         ?: ctx.getSystemService(Context.CONNECTIVITY_SERVICE)) as ConnectivityManager
@@ -183,6 +186,7 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
             @Suppress("DEPRECATION")
             audio.isWiredHeadsetOn || audio.isBluetoothA2dpOn
         }
+        o.put("hotspot", hotspotOn())
         o.put("audio", hasHeadphones)
         o.put("btAudio", btRouted())
         o.put("loc", Radios.isLocOn(ctx))      // drives the quick-settings grid
@@ -237,6 +241,24 @@ class StatusMonitor(private val ctx: Context, private val emit: (String) -> Unit
      */
     @Volatile var last: JSONObject? = null
         private set
+
+    /**
+     * Is this phone currently sharing its connection over Wi-Fi?
+     *
+     * There is no public API for it: WifiManager.isWifiApEnabled is hidden and blocked to
+     * reflection since Android 11, and TetheringManager is a system API. What is public is the
+     * interface list — a tether brings up its own interface with its own IPv4 address, which
+     * this device's own tethering config calls ap_br_wlan*. wlan0 is deliberately excluded:
+     * that is the station interface, up whenever Wi-Fi is merely connected.
+     */
+    private fun hotspotOn(): Boolean = try {
+        java.net.NetworkInterface.getNetworkInterfaces().asSequence().any { ni ->
+            ni.isUp && !ni.isLoopback && TETHER_IFACE.containsMatchIn(ni.name) &&
+                ni.inetAddresses.asSequence().any { it is java.net.Inet4Address && !it.isLoopbackAddress }
+        }
+    } catch (e: Throwable) {
+        false
+    }
 
     /**
      * Is media audio actually routed out over Bluetooth right now? Not the same as the

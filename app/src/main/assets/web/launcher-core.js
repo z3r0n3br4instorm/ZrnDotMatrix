@@ -213,7 +213,7 @@ class Launcher {
     this.appsLoaded = false;                             // native is reading app labels right now
     this.appsBuildAt = Date.now();
     this.palName = 'Mono';
-    this.status = { batt: 100, charging: false, wifi: false, data: false, ssid: '', bt: false, btAudio: false, audio: false, playing: false, track: '', artist: '', signal: 3, alarm: '', cpu: 20, ram: 50, notif: [] };
+    this.status = { batt: 100, charging: false, wifi: false, data: false, ssid: '', bt: false, hotspot: false, btAudio: false, audio: false, playing: false, track: '', artist: '', signal: 3, alarm: '', cpu: 20, ram: 50, notif: [] };
     this.weather = { kind: null, temp: null };
     this.lastKey = null;
     this.config = this.bridge.getConfig ? this.bridge.getConfig() : {
@@ -1253,7 +1253,7 @@ class Launcher {
       const rg = this.rigel && (this.rigel.activeMini || this.rigel.state === 'listening');
       k.push(d.getMilliseconds() < 500, wxMs ? Math.floor(A / wxMs) % 2 : 0, rg ? Math.floor(A / 60) : 0,
         st.batt, st.charging, st.charging ? Math.floor(A / 120) : 0,
-        st.wifi, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
+        st.wifi, st.hotspot, st.bt, st.data, st.audio, st.playing, st.track, st.artist, st.signal, st.ssid, st.alarm, w.kind, w.temp,
         st.cpu, st.ram, this.gpuLoad, !!this.activeEvent, this.eventQueue.length,
         this.predShowing(A) ? this.pred.pkg : '',        // app suggestion (static once drawn)
         this.battWarn() && A % 1000 < 620,               // low-battery blink phase
@@ -1459,7 +1459,18 @@ class Launcher {
     for (let k = 0; k < lvl; k++) g.hline(6, 8, 20 - k, battTint);
     if (st.charging && this.midKind(A) !== 'charge') g.bmp(LIGHTNING_BOLT, 12, 13, 9);
     [2, 3, 4, 5].forEach((h, k) => g.vline(4 + k * 2, 30 - h, 29, k < st.signal ? 1 : 3));
-    g.bmp(ICONS.wifi, 4, 33, st.wifi ? 1 : 3);
+    // Hotspot: <-> replaces the Wi-Fi mark when that is all that is happening, and sits
+    // beside it when the phone is both connected and sharing — the two facts are independent
+    // and collapsing them would hide which one is true. Accent tint, because sharing is a
+    // state worth noticing rather than ambient like the radios either side of it.
+    if (st.hotspot && st.wifi) {
+      g.bmp(ICONS.wifi, 4, 33, 1);
+      g.bmp(ICONS.share, 12, 33, 2);
+    } else if (st.hotspot) {
+      g.bmp(ICONS.share, 4, 33, 2);
+    } else {
+      g.bmp(ICONS.wifi, 4, 33, st.wifi ? 1 : 3);
+    }
     g.bmp(ICONS.bt, 5, 40, st.bt ? 1 : 3);
   }
 
