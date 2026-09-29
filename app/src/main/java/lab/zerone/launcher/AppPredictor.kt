@@ -73,6 +73,8 @@ class AppPredictor(private val act: MainActivity) {
     @Volatile private var pending: Pending? = null
 
     @Volatile private var lastEventTs = 0L
+    /** PAUSED timestamp of the newest session already folded in; see the overlap note. */
+    @Volatile private var recordedUpTo = 0L
     @Volatile private var lastDecayDay = 0L
     @Volatile private var loaded = false
     @Volatile private var lastRefresh = 0L
@@ -163,6 +165,11 @@ class AppPredictor(private val act: MainActivity) {
                     val startedAt = open.remove(pkg) ?: continue
                     val dur = ev.timeStamp - startedAt
                     if (dur <= 0) continue
+                    // The query window deliberately overlaps the previous one, so a session
+                    // already folded in must not be counted twice. Sessions close in stream
+                    // order, so one high-water end timestamp is enough.
+                    if (ev.timeStamp <= recordedUpTo) continue
+                    recordedUpTo = ev.timeStamp
                     record(pkg, startedAt, dur, prev)
                     prev = pkg
                 }
@@ -174,7 +181,14 @@ class AppPredictor(private val act: MainActivity) {
         // dropped for good. That systematically lost the app you were in most recently, which
         // is precisely the one a pending guess needs grading against.
         val earliestOpen = open.values.minOrNull()
-        lastEventTs = if (earliestOpen != null) minOf(maxTs, earliestOpen - 1) else maxTs
+        var next = if (earliestOpen != null) minOf(maxTs, earliestOpen - 1) else maxTs
+        // Hold the watermark back from the present. maxTs advances on every event seen —
+        // including this launcher's own, which are ignored for counting — so when the system
+        // has not yet flushed another app's events the mark would jump straight past them and
+        // they could never be read again. Re-reading the tail is safe: recordedUpTo drops any
+        // session already counted.
+        next = minOf(next, now - EVENT_LAG_MS)
+        if (next > lastEventTs) lastEventTs = next
         lastPkg = prev
     }
 
@@ -189,8 +203,14 @@ class AppPredictor(private val act: MainActivity) {
         if (ignored(pkg)) return
         try {
             ensureLoaded()
-            if (hasUsageAccess()) { lastPkg = pkg; return }
-            val now = System.currentTimeMillis()
+            val nowMs = System.currentTimeMillis()
+            // Grade here regardless of which source owns the counting. This is the one signal
+            // that is exact and immediate — the user pressed the thing — whereas UsageStats
+            // events surface on the system's own schedule, which can be well after the fact.
+            // Grading only touches the correction term, so it never double-counts.
+            grade(pkg, nowMs)
+            if (hasUsageAccess()) { lastPkg = pkg; saveAsync(); return }
+            val now = nowMs
             record(pkg, now, ASSUMED_SESSION_MS, lastPkg)
             lastPkg = pkg
             save()
@@ -493,6 +513,7 @@ class AppPredictor(private val act: MainActivity) {
         try {
             val root = JSONObject(f.readText())
             lastEventTs = root.optLong("lastEventTs", 0L)
+            recordedUpTo = root.optLong("recordedUpTo", 0L)
             lastDecayDay = root.optLong("lastDecayDay", 0L)
             lastPkg = root.optString("lastPkg", "").ifEmpty { null }
             val apps = root.optJSONObject("apps") ?: JSONObject()
@@ -556,6 +577,7 @@ class AppPredictor(private val act: MainActivity) {
             }
             file.writeText(JSONObject()
                 .put("lastEventTs", lastEventTs)
+                .put("recordedUpTo", recordedUpTo)
                 .put("lastDecayDay", lastDecayDay)
                 .put("lastPkg", lastPkg ?: "")
                 .put("apps", apps).put("trans", tr).put("bias", bi)
@@ -574,7 +596,7 @@ class AppPredictor(private val act: MainActivity) {
     /** Settings "forget everything" — the model is behavioural data, so this has to exist. */
     fun clear() {
         stats.clear(); transitions.clear(); bias.clear()
-        lastEventTs = 0L; lastDecayDay = 0L; lastPkg = null; pending = null
+        lastEventTs = 0L; recordedUpTo = 0L; lastDecayDay = 0L; lastPkg = null; pending = null
         try { file.delete() } catch (e: Throwable) {}
     }
 
@@ -619,6 +641,8 @@ class AppPredictor(private val act: MainActivity) {
         // rather than just counting launches. Accept outweighs reject so the model is not
         // talked out of a good habit by one distracted morning.
         private const val REWARD_WINDOW_MS = 90_000L     // a launch this soon is an answer
+        /** How far behind the present the event watermark is held. */
+        private const val EVENT_LAG_MS = 60_000L
         private const val ACCEPT_LR = 0.60               // named it, you opened it
         private const val REJECT_LR = 0.35               // named it, you opened something else
         private const val ALT_LR = 0.25                  // ...and what you opened instead
