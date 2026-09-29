@@ -80,6 +80,11 @@ class AppPredictor(private val act: MainActivity) {
     @Volatile private var lastPkg: String? = null
 
     private val file: File get() = File(act.filesDir, "appmodel.json")
+    /** Single thread: writes are small but must not land on the JS/UI thread, and must not
+     *  interleave with each other. */
+    private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    private fun saveAsync() { try { io.execute { save() } } catch (e: Throwable) {} }
 
     // ---- access ---------------------------------------------------------------------------
 
@@ -271,8 +276,11 @@ class AppPredictor(private val act: MainActivity) {
                        else "suggest ${best.pkg} score=${"%.2f".format(best.score)}")
             if (best == null) return "{}"
             // Naming an app IS the action the policy took, so this is where the bet is placed;
-            // record() grades it against whatever gets opened next.
+            // record() grades it against whatever gets opened next. Written out immediately
+            // (off-thread): the launcher is usually killed between placing the bet and seeing
+            // it answered, so a bet only held in memory is one the model never learns from.
             pending = Pending(best.pkg, slotOf(System.currentTimeMillis()), System.currentTimeMillis())
+            saveAsync()
             JSONObject()
                 .put("pkg", best.pkg)
                 .put("label", best.label)
