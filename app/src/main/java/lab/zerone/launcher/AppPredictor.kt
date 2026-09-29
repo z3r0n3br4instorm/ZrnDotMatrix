@@ -168,9 +168,13 @@ class AppPredictor(private val act: MainActivity) {
                 }
             }
         }
-        // Whatever is still foreground at the end of the window has no PAUSED yet — leave it
-        // for the next pass rather than inventing a duration for it.
-        lastEventTs = maxTs
+        // Whatever is still foreground at the end of the window has no PAUSED yet. Leaving it
+        // for the next pass only works if the watermark stays BEHIND its RESUMED — advancing
+        // past it meant the pair could never complete on any later pass, so the session was
+        // dropped for good. That systematically lost the app you were in most recently, which
+        // is precisely the one a pending guess needs grading against.
+        val earliestOpen = open.values.minOrNull()
+        lastEventTs = if (earliestOpen != null) minOf(maxTs, earliestOpen - 1) else maxTs
         lastPkg = prev
     }
 
@@ -273,7 +277,7 @@ class AppPredictor(private val act: MainActivity) {
             // One line per ask: "is the model empty, is nothing clearing the bar, or is the
             // UI simply not drawing what it was given" is otherwise guesswork from outside.
             android.util.Log.d(TAG, if (best == null) "no candidate (apps=${stats.size})"
-                       else "suggest ${best.pkg} score=${"%.2f".format(best.score)}")
+                       else "suggest ${best.pkg} confidence=${"%.2f".format(best.score)}")
             if (best == null) return "{}"
             // Naming an app IS the action the policy took, so this is where the bet is placed;
             // record() grades it against whatever gets opened next. Written out immediately
@@ -315,6 +319,7 @@ class AppPredictor(private val act: MainActivity) {
         var bestPkg: String? = null
         var bestLabel: String? = null
         var bestScore = Double.NEGATIVE_INFINITY
+        val scores = ArrayList<Double>(stats.size)
 
         for ((pkg, s) in stats) {
             if (s.launches < MIN_APP_LAUNCHES) continue
@@ -353,12 +358,22 @@ class AppPredictor(private val act: MainActivity) {
             if (headphones && looksLikeMedia(pkg)) score += W_CONTEXT
             if (charging && s.avgMs() > LONG_SESSION_MS) score += W_CONTEXT * 0.5
 
+            scores.add(score)
             if (score > bestScore) { bestScore = score; bestPkg = pkg; bestLabel = label }
         }
 
         val pkg = bestPkg ?: return null
-        if (bestScore < MIN_SCORE) return null
-        return Candidate(pkg, bestLabel ?: return null, bestScore)
+        // Confidence, not a raw cutoff. The score is a sum of log terms whose scale moves with
+        // how many apps are installed and how many launches are on record, so any absolute
+        // threshold means something different on every phone — and drifted past its own cutoff
+        // here after a handful of launches. A softmax over the candidates asks the question
+        // that actually matters: given everything else it could have said, how much of the
+        // probability mass is on this one? Scale-free, and directly interpretable.
+        var sum = 0.0
+        for (v in scores) sum += Math.exp(v - bestScore)   // shifted: the max term is exp(0)=1
+        val confidence = if (sum > 0) 1.0 / sum else 0.0
+        if (confidence < MIN_CONFIDENCE) return null
+        return Candidate(pkg, bestLabel ?: return null, confidence)
     }
 
     private fun Stat.avgMs(): Double = if (launches > 0) totalMs / launches else 0.0
@@ -555,7 +570,8 @@ class AppPredictor(private val act: MainActivity) {
         // Bars for showing anything at all.
         private const val MIN_TOTAL_LAUNCHES = 12.0
         private const val MIN_APP_LAUNCHES = 2.0
-        private const val MIN_SCORE = -9.5
+        /** Share of the probability mass the winner must hold. ~1-in-4 or better. */
+        private const val MIN_CONFIDENCE = 0.22
         private const val SUPPRESS_RECENT_MS = 3 * 60_000L
 
         private const val DAILY_DECAY = 0.985            // ~46-day half-life
