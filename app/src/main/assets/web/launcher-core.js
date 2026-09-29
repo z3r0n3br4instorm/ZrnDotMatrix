@@ -1618,7 +1618,10 @@ class Launcher {
     if (this.activeEvent) return 'ev:' + this.activeEvent.type + p;
     if (!this.status.charging && this.status.batt < BATT_CRIT) return 'lowbatt' + p;
     if (this.status.playing) return this.status.btAudio ? 'btaudio' : 'wave';
-    if (this.status.charging) return 'charge';
+    // The suggestion is a 5s offer, so it borrows the slot from the charging graphic rather
+    // than being locked out for the whole time the phone is on a charger — which is most of
+    // the night and much of the day at a desk, i.e. exactly when you do pick the phone up.
+    if (this.status.charging) return this.predShowing(A) ? 'pred:' + this.pred.pkg : 'charge';
     if (this.battWarn()) return 'lowbatt';
     if (this.predShowing(A)) return 'pred:' + this.pred.pkg;
     if (this.config.sysStats) return 'sys';
@@ -1689,7 +1692,9 @@ class Launcher {
     } else if (this.status.playing) {
       this.drawWave(g, A, bottom);
     } else if (this.status.charging) {
-      this.drawCharging(g, A, cy);
+      // Mirrors midKind: the 5s offer borrows this slot, then hands it back to the charger.
+      if (this.predShowing(A)) this.drawPrediction(g, A, cy);
+      else this.drawCharging(g, A, cy);
     } else if (this.battWarn()) {
       this.drawLowBattery(g, A, cy);
     } else if (this.predShowing(A)) {
