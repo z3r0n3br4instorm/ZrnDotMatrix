@@ -2,7 +2,9 @@ name: Build and Deploy APKs
 
 on:
   push:
-    branches: [ main, master ]
+    # main/master cut the versioned "Latest" release. debug only refreshes the rolling
+    # "Latest Debug Release", which never takes the Latest badge from a real release.
+    branches: [ main, master, debug ]
     tags:
       - 'v*'
   workflow_dispatch:
@@ -55,12 +57,20 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug & Release APKs
-        run: ./gradlew assembleDebug assembleRelease --stacktrace
+        run: |
+          # The debug channel ships only the debug APK; skip the release build to keep it quick.
+          if [[ "${{ github.ref }}" == refs/heads/debug ]]; then
+            ./gradlew assembleDebug --stacktrace
+          else
+            ./gradlew assembleDebug assembleRelease --stacktrace
+          fi
 
       - name: Rename APKs for distribution
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/release/app-release.apk dist/ZrnDotMatrix-release.apk
+          if [ -f app/build/outputs/apk/release/app-release.apk ]; then
+            cp app/build/outputs/apk/release/app-release.apk dist/ZrnDotMatrix-release.apk
+          fi
           cp app/build/outputs/apk/debug/app-debug.apk dist/ZrnDotMatrix-debug.apk
 
       - name: Upload APKs as Workflow Artifacts
@@ -102,3 +112,20 @@ jobs:
           files: dist/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Rolling debug channel. The tag is moved onto every debug push and the release is
+      # recreated, so it always holds exactly one build: the newest. --latest=false and
+      # --prerelease keep it from ever displacing the versioned Latest release above.
+      - name: Publish Latest Debug Release
+        if: github.ref == 'refs/heads/debug'
+        run: |
+          TAG=latest-debug
+          gh release delete "$TAG" --cleanup-tag --yes || true
+          git push origin ":refs/tags/$TAG" || true
+          gh release create "$TAG" dist/ZrnDotMatrix-debug.apk \
+            --target "$GITHUB_SHA" \
+            --title "Latest Debug Release" \
+            --notes "Rolling debug build of \`${GITHUB_SHA::7}\` from the debug branch (app ${{ steps.vars.outputs.version }}). Replaced on every push to debug." \
+            --prerelease --latest=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
