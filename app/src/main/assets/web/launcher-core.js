@@ -124,38 +124,32 @@ const WARN_TRI = [
 const BATT_WARN = 25;
 const BATT_CRIT = 15;
 
-// Charging bolt for the middle widget, 11x17 — taller than the 13-row battery shell on
-// purpose, so it breaks out above and below it, tapering to a point at each end.
-const CHARGE_BOLT = [
-  '........X..',
-  '.......XX..',
-  '......XXX..',
-  '.....XXXX..',
-  '....XXXX...',
-  '...XXXX....',
-  '..XXXX.....',
-  'XXXXXXXXXX.',
-  'XXXXXXXXXXX',
-  '.XXXXXXXXXX',
-  '......XXXX.',
-  '.....XXXX..',
-  '....XXXX...',
-  '...XXXX....',
-  '..XXX......',
-  '.XX........',
-  'X..........'
+// Plug for the middle widget, 13x9, lying on its side with its prongs pointing into the
+// battery shell's left wall. A bolt at this resolution read as a stray diagonal; a plug
+// with two prongs and a cable is unmistakable even at a glance.
+const CHARGE_PLUG = [
+  '.....XXXX....',
+  '....XXXXXX...',
+  '....XXXXXXXXX',
+  '....XXXXXX...',
+  'XXXXXXXXXX...',
+  '....XXXXXX...',
+  '....XXXXXXXXX',
+  '....XXXXXX...',
+  '.....XXXX....'
 ];
 
-// Activity lightning bolt icon (shown to the right of battery)
-const LIGHTNING_BOLT = [
-  '...XX.',
-  '..XX..',
-  '.XX...',
-  'XXXXX.',
-  '...XX.',
-  '..XX..',
-  '.XX...',
-  'XX....'
+// Small upright plug beside the status-bar battery, 5x9 to match its height.
+const PLUG_SMALL = [
+  '.X.X.',
+  '.X.X.',
+  'XXXXX',
+  'XXXXX',
+  'XXXXX',
+  '.XXX.',
+  '..X..',
+  '..X..',
+  '..X..'
 ];
 
 // Media player control button bitmaps (5x5)
@@ -1464,7 +1458,7 @@ class Launcher {
     g.bmp(ICONS.battV, 5, 13, battTint);
     const lvl = Math.max(1, Math.round(st.batt / 100 * 6));
     for (let k = 0; k < lvl; k++) g.hline(6, 8, 20 - k, battTint);
-    if (st.charging && this.midKind(A) !== 'charge') g.bmp(LIGHTNING_BOLT, 12, 13, 9);
+    if (st.charging && this.midKind(A) !== 'charge') g.bmp(PLUG_SMALL, 12, 13, 9);
     [2, 3, 4, 5].forEach((h, k) => g.vline(4 + k * 2, 30 - h, 29, k < st.signal ? 1 : 3));
     // Hotspot: <-> replaces the Wi-Fi mark when that is all that is happening, and sits
     // beside it when the phone is both connected and sharing — the two facts are independent
@@ -1906,8 +1900,10 @@ class Launcher {
 
   drawCharging(g, A, cy) {
     const st = this.status;
-    const top = cy - 13;                                 // shell rows top..top+12, bolt top-2..top+14
-    const bx = 22;
+    const top = cy - 13;                                 // shell rows top..top+12
+    // Plug (13) + gap (1) + shell and nub (24), centred as one piece in the widget.
+    const px = MID_L + Math.floor((MID_R - MID_L + 1 - 38) / 2);
+    const bx = px + 14;
     g.frame(bx, top, bx + 21, top + 12, 1);
     g.vline(bx + 22, top + 4, top + 8, 1);
     g.vline(bx + 23, top + 4, top + 8, 1);
@@ -1918,7 +1914,7 @@ class Launcher {
         g.set(bx + 2 + c, r, c < have ? 1 : c < fill ? 3 : 0);
       }
     }
-    g.bmp(CHARGE_BOLT, 27, top - 2, 9);                  // breaks out of the shell top and bottom
+    g.bmp(CHARGE_PLUG, px, top + 2, 9);                  // centred on the shell's middle row
     g.text3fit('CHARGING', MID_L, MID_R, top + 18, 1, A);
     g.text3fit(st.batt >= 100 ? 'FULL' : 'PLUGGED IN ' + st.batt + '%', MID_L, MID_R, top + 25, 3, A);
   }
