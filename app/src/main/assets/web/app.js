@@ -62,6 +62,8 @@
     copyUnlockCommand: () => (N && N.copyUnlockCommand ? N.copyUnlockCommand() : false),
     openTermuxApp: () => (N && N.openTermuxApp ? N.openTermuxApp() : false),
     predictApp: () => (N && N.predictApp ? N.predictApp() : '{}'),
+    predictionShown: (pkg) => { if (N && N.predictionShown) N.predictionShown(pkg); },
+    dismissPrediction: (pkg) => { if (N && N.dismissPrediction) N.dismissPrediction(pkg); },
     hasUsageAccess: () => (N && N.hasUsageAccess ? N.hasUsageAccess() : false),
     openUsageAccess: () => { if (N && N.openUsageAccess) N.openUsageAccess(); },
     clearPredictions: () => { if (N && N.clearPredictions) N.clearPredictions(); },

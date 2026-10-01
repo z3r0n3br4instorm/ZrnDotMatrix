@@ -156,6 +156,14 @@ class Bridge(private val act: MainActivity) {
     @JavascriptInterface
     fun predictApp(): String = act.predictor.predict()
 
+    /** The UI put [pkg] on screen as a suggestion. Once per offer, so a pass-over can be told. */
+    @JavascriptInterface
+    fun predictionShown(pkg: String) { Thread { act.predictor.noteShown(pkg) }.start() }
+
+    /** Double-tapped away: mutes that routine's window rather than just this one offer. */
+    @JavascriptInterface
+    fun dismissPrediction(pkg: String) { Thread { act.predictor.dismiss(pkg) }.start() }
+
     /** True once the user has granted usage access; the model works without it, just worse. */
     @JavascriptInterface
     fun hasUsageAccess(): Boolean = act.predictor.hasUsageAccess()

@@ -928,6 +928,10 @@ class Launcher {
       // splash, and a shorter offer would expire before it was ever drawn.
       const bootEndsAt = this.t0 + BOOT_BRAND_MS;
       this.predShownAt = Math.max(Date.now(), bootEndsAt);
+      // Tell the model it was actually offered, so passing it over counts against it.
+      if (this.config.appSuggest !== false && p.pkg !== this.predDismissedPkg && this.bridge.predictionShown) {
+        this.bridge.predictionShown(p.pkg);
+      }
     }
     // A dismissal applies to the guess you dismissed, not to the feature: once the model
     // moves on to a different app, that new suggestion is allowed to ask.
@@ -964,6 +968,7 @@ class Launcher {
       clearTimeout(this.predTapTimer);
       this.predTapTimer = null;
       this.predDismissedPkg = this.pred ? this.pred.pkg : '';
+      if (this.pred && this.bridge.dismissPrediction) this.bridge.dismissPrediction(this.pred.pkg);
       if (this.config.haptics && this.bridge.hapticTransition) this.bridge.hapticTransition();
       this.lastKey = null;
       return;

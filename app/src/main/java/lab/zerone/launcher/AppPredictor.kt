@@ -1,91 +1,98 @@
 package lab.zerone.launcher
 
+import android.Manifest
 import android.app.AppOpsManager
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.Build
 import android.os.Process
+import androidx.core.content.ContextCompat
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.util.Calendar
-import java.util.concurrent.ConcurrentHashMap
-import kotlin.math.ln
-import kotlin.math.max
-import kotlin.math.min
+import java.util.TimeZone
+import kotlin.math.roundToInt
 
 /**
- * Predicts the app you are about to open, for the home screen's "OPEN <APP>?" widget.
+ * Suggests the app you are about to need, for the home screen's "OPEN <APP>?" widget — and,
+ * more often than not, suggests nothing at all.
  *
- * Deliberately not a foundation model. Google's own app prediction rides
- * `android.app.prediction.AppPredictionManager`, which is `@SystemApi` — system-signature only,
- * unreachable from a third-party launcher even as the default home — and Gemini Nano via ML Kit
- * is a text generator, wrong shape for this and gated to a handful of devices. This is a
- * frequency/recency model instead: it answers in microseconds, needs no network, no extra
- * dependency, and every byte of history stays in this app's private storage.
+ * The previous model scored every app at every unlock and showed whichever won, which on a
+ * real phone meant WhatsApp most of the time: an app opened 150 times a day wins any
+ * frequency contest without telling you anything you did not already know. This one looks for
+ * *routines* instead — "Uber, weekday mornings, 08:45-09:30" — and stays quiet whenever the
+ * present moment is not inside one. A launcher that always offers something trains you to
+ * ignore it, or worse, to open it.
  *
- * Two sources feed it, and the difference matters:
- *  - [UsageStatsManager] is the good one. It reports *real* foreground durations and comes with
- *    history already in it, so predictions are useful the first day rather than after weeks of
- *    self-logging, and it sees launches from anywhere — recents, notifications, another
- *    launcher — not just ones this launcher started. It needs PACKAGE_USAGE_STATS, which is a
- *    special access the user grants on a Settings screen and no app can grant itself.
- *  - [noteLaunch] is the fallback for when that access is not granted. It only sees launches
- *    that went through this launcher and cannot observe true durations, so the model is
- *    strictly worse — but it works with zero permissions and needs no consent.
+ * Pipeline, each step there because the device's own logs showed the noise it removes:
+ *  1. Sessions. UsageStats RESUMED/PAUSED pairs; anything under [MIN_DWELL_MS] is a misfire.
+ *  2. Episodes. Repeat opens of one app within [EPISODE_GAP_MS] fold into one: checking a ride
+ *     every two minutes is one trip, not seventeen launches.
+ *  3. Notification-led episodes are kept but never count as routine evidence. Two thirds of
+ *     WhatsApp and Teams opens came within minutes of their own notification — that is the
+ *     notification doing its job, and the shade already offers that app.
+ *  4. Ambient apps — used most days, all through the day — are never suggested. Feeds
+ *     (social, video, games, news) are never suggested either. Neither has a "when".
+ *  5. Routine windows are mined per app from the remaining episode starts: dense 15-minute
+ *     bins grown into a window of at most three hours, kept only with [MIN_DAYS] distinct days
+ *     of evidence and a rate [MIN_LIFT]x the app's own baseline.
+ *  6. At unlock a window is live from [LEAD_MIN] before its start to its end. Its support is
+ *     the share of comparable days it fired on — same weekday, shrunk toward same day type
+ *     while weekdays are thin — and place (Wi-Fi network or coarse cell) gates it once the
+ *     routine has a place on record.
+ *  7. It stops asking once you have done the thing today, after [MAX_IGNORED] unlocks of being
+ *     ignored, while that app has a notification waiting, or for [MUTE_MS] after a dismiss.
  *
- * Raw events are never kept. They fold immediately into a sparse per-app aggregate (see [Stat]),
- * which is all that is persisted: roughly "how often, how long, and when" per package.
+ * Everything stays in this app's private storage. Places are stored as a hashed network name
+ * or a ~1 km grid cell, never as coordinates or an SSID.
  */
 class AppPredictor(private val act: MainActivity) {
 
-    /**
-     * What the model remembers about one package. Counts are Double rather than Int because
-     * they are both dwell-weighted on the way in and exponentially decayed over time, so they
-     * are never whole numbers in practice.
-     */
-    private class Stat {
-        @Volatile var launches = 0.0
-        @Volatile var totalMs = 0.0
-        @Volatile var lastUsed = 0L
-        /** Sparse: key is [slotOf]'s dayType*24+hour, value the dwell-weighted count there. */
-        val slots = ConcurrentHashMap<Int, Double>()
+    /** One episode: [t] its first open, [d] first open to last close, [led] notification-led. */
+    private class Episode(val pkg: String, val t: Long, var d: Long, val led: Boolean, val place: String)
+
+    /** A mined routine: [pkg] tends to be opened between [lo] and [hi] minutes past midnight. */
+    private class Routine(
+        val pkg: String, val lo: Int, val hi: Int,
+        val hitDays: Set<Int>, val places: Map<String, Int>, val lift: Double
+    ) {
+        val key get() = "$pkg@$lo"
     }
 
-    private val stats = ConcurrentHashMap<String, Stat>()
-    /** prev package -> next package -> dwell-weighted count. "What usually follows X." */
-    private val transitions = ConcurrentHashMap<String, ConcurrentHashMap<String, Double>>()
+    private val episodes = ArrayList<Episode>()
+    /** Local day numbers the phone was actually used on — the denominator of every support. */
+    private val days = java.util.TreeSet<Int>()
+    /** Recent notification times per package, so a session can tell it was answering one. A
+     *  list, not the latest: messages arriving mid-chat must not hide the one that opened it. */
+    private val lastNotif = HashMap<String, ArrayList<Long>>()
+    /** (time, place) samples taken whenever the launcher looks; episodes borrow the nearest. */
+    private val placeLog = ArrayList<Pair<Long, String>>()
+    /** Routine key -> muted until (ms). Set by a dismiss or by being ignored for weeks. */
+    private val muted = HashMap<String, Long>()
+    /** Routine key -> [shown, accepted], decayed; what the user thinks of each routine. */
+    private val verdict = HashMap<String, DoubleArray>()
+    /** Routine key -> unlocks ignored today, as "day:count". Transient by nature. */
+    private val ignoredToday = HashMap<String, Int>()
+    private var ignoredDay = -1
 
-    /**
-     * Learned correction per package per time slot, added straight to the score.
-     *
-     * This is the reinforcement part, and it is a contextual bandit rather than anything
-     * deeper: the slot is the context, naming one app is the action, and what you open next
-     * is the reward. Counting alone cannot represent "you open this constantly but never the
-     * time I offer it" — the counts say it is popular either way. A signed term that only
-     * moves when a guess is graded can, and it moves fast, because a handful of corrections
-     * should visibly change behaviour rather than being averaged into thousands of launches.
-     */
-    private val bias = ConcurrentHashMap<String, ConcurrentHashMap<Int, Double>>()
-
-    /** The guess currently awaiting a verdict: what was named, in which slot, and when. */
-    private class Pending(val pkg: String, val slot: Int, val at: Long)
-    @Volatile private var pending: Pending? = null
+    @Volatile private var routines: List<Routine> = emptyList()
+    private class Shown(val pkg: String, val key: String, val at: Long) { var accepted = false }
+    @Volatile private var lastShown: Shown? = null
 
     @Volatile private var lastEventTs = 0L
-    /** PAUSED timestamp of the newest session already folded in; see the overlap note. */
     @Volatile private var recordedUpTo = 0L
-    @Volatile private var lastDecayDay = 0L
     @Volatile private var loaded = false
     @Volatile private var lastRefresh = 0L
-    /** Set by [noteLaunch]/ingest so the transition model knows what you just came from. */
-    @Volatile private var lastPkg: String? = null
+    @Volatile private var lastDecayDay = 0
 
-    private val file: File get() = File(act.filesDir, "appmodel.json")
-    /** Single thread: writes are small but must not land on the JS/UI thread, and must not
-     *  interleave with each other. */
+    private val file: File get() = File(act.filesDir, "routines.json")
+    private val legacyFile: File get() = File(act.filesDir, "appmodel.json")
+    private val lock = Any()
     private val io = java.util.concurrent.Executors.newSingleThreadExecutor()
-
     private fun saveAsync() { try { io.execute { save() } } catch (e: Throwable) {} }
 
     // ---- access ---------------------------------------------------------------------------
@@ -110,9 +117,9 @@ class AppPredictor(private val act: MainActivity) {
     // ---- ingest ---------------------------------------------------------------------------
 
     /**
-     * Folds any usage events newer than the last pass into the aggregate. Cheap to call often:
-     * it no-ops unless [minGapMs] has elapsed, since UsageStatsManager itself batches events
-     * and re-querying a few seconds later would just walk the same window again.
+     * Folds new usage events in and re-mines the routines. Cheap enough to call on every
+     * return to the home screen: a no-op inside [minGapMs], and the miner walks a few hundred
+     * episodes, not raw events.
      */
     fun refresh(minGapMs: Long = 5 * 60_000L) {
         val now = System.currentTimeMillis()
@@ -120,16 +127,16 @@ class AppPredictor(private val act: MainActivity) {
         lastRefresh = now
         try {
             ensureLoaded()
-            decayIfNeeded(now)
-            if (hasUsageAccess()) ingestUsageEvents(now)
-            // Ingest first, then commit to a guess for the period ahead. Runs whether or not
-            // the widget is on — with it off this is the only thing keeping the reinforcement
-            // loop alive, which is the point of "keep learning in the background".
-            formHypothesis()
+            synchronized(lock) {
+                samplePlace(now)
+                if (hasUsageAccess()) ingestUsageEvents(now)
+                prune(now)
+                decayIfNeeded(now)
+                routines = mine(now)
+            }
             save()
-            // Ingest runs off the UI thread and a first pass walks a month of events, so the
-            // UI's own startup ask can easily beat it and see an empty model. Tell it when
-            // there is actually something to ask about.
+            android.util.Log.d(TAG, "refresh: ${episodes.size} episodes, ${days.size} days, " +
+                "routines=${routines.joinToString { "${it.pkg}@${hhmm(it.lo)}-${hhmm(it.hi)}(${it.hitDays.size}d)" }}")
             act.js("ZL.predictionReady()")
         } catch (e: Throwable) {
             // A prediction is a nicety; never let it take the launcher down.
@@ -141,7 +148,7 @@ class AppPredictor(private val act: MainActivity) {
         val usm = act.getSystemService(Context.USAGE_STATS_SERVICE) as? UsageStatsManager ?: return
         // First run has no watermark: take a month. The platform keeps far less event detail
         // than that, so in practice this is "everything it still has".
-        val since = if (lastEventTs > 0) lastEventTs + 1 else now - 30L * 24 * 3600_000L
+        val since = if (lastEventTs > 0) lastEventTs + 1 else now - BACKFILL_MS
         if (since >= now) return
 
         val events = usm.queryEvents(since, now)
@@ -150,7 +157,6 @@ class AppPredictor(private val act: MainActivity) {
         // is enough to pair RESUMED with the PAUSED that closes it.
         val open = HashMap<String, Long>()
         var maxTs = lastEventTs
-        var prev: String? = lastPkg
 
         while (events.hasNextEvent()) {
             events.getNextEvent(ev)
@@ -170,172 +176,196 @@ class AppPredictor(private val act: MainActivity) {
                     // order, so one high-water end timestamp is enough.
                     if (ev.timeStamp <= recordedUpTo) continue
                     recordedUpTo = ev.timeStamp
-                    record(pkg, startedAt, dur, prev)
-                    prev = pkg
+                    record(pkg, startedAt, dur)
+                }
+                // Hidden constant: NOTIFICATION_INTERRUPTION. Delivered to usage-access holders
+                // with the channel obfuscated, which is fine — only the package matters here.
+                EVENT_NOTIFICATION_INTERRUPTION -> lastNotif.getOrPut(pkg) { ArrayList() }.let {
+                    it.add(ev.timeStamp)
+                    if (it.size > NOTIF_KEEP) it.removeAt(0)
                 }
             }
         }
-        // Whatever is still foreground at the end of the window has no PAUSED yet. Leaving it
-        // for the next pass only works if the watermark stays BEHIND its RESUMED — advancing
-        // past it meant the pair could never complete on any later pass, so the session was
-        // dropped for good. That systematically lost the app you were in most recently, which
-        // is precisely the one a pending guess needs grading against.
+        // Whatever is still foreground at the end of the window has no PAUSED yet; keep the
+        // watermark behind its RESUMED so the pair can complete on a later pass. Also hold it
+        // back from the present, because the system flushes other apps' events late.
         val earliestOpen = open.values.minOrNull()
         var next = if (earliestOpen != null) minOf(maxTs, earliestOpen - 1) else maxTs
-        // Hold the watermark back from the present. maxTs advances on every event seen —
-        // including this launcher's own, which are ignored for counting — so when the system
-        // has not yet flushed another app's events the mark would jump straight past them and
-        // they could never be read again. Re-reading the tail is safe: recordedUpTo drops any
-        // session already counted.
         next = minOf(next, now - EVENT_LAG_MS)
         if (next > lastEventTs) lastEventTs = next
-        lastPkg = prev
     }
 
     /**
-     * The own-log fallback, called from [Bridge.launch]. No duration is observable here — the
-     * launcher is being backgrounded, so it cannot see when you leave the app again — so this
-     * assumes a middling session rather than pretending to know. Ignored entirely when usage
-     * access is granted, since that path records the same launch with a real duration and
-     * double-counting would skew the model toward launcher-initiated opens.
+     * The own-log fallback, called from [Bridge.launch]. It is also the one exact, immediate
+     * signal that a shown suggestion was taken, so it grades that even when UsageStats owns
+     * the counting.
      */
     fun noteLaunch(pkg: String) {
         if (ignored(pkg)) return
         try {
             ensureLoaded()
-            val nowMs = System.currentTimeMillis()
-            // Grade here regardless of which source owns the counting. This is the one signal
-            // that is exact and immediate — the user pressed the thing — whereas UsageStats
-            // events surface on the system's own schedule, which can be well after the fact.
-            // Grading only touches the correction term, so it never double-counts.
-            grade(pkg, nowMs, true)
-            if (hasUsageAccess()) { lastPkg = pkg; saveAsync(); return }
-            val now = nowMs
-            record(pkg, now, ASSUMED_SESSION_MS, lastPkg)
-            lastPkg = pkg
-            save()
+            val now = System.currentTimeMillis()
+            synchronized(lock) {
+                accept(pkg, now)
+                if (!hasUsageAccess()) { samplePlace(now); record(pkg, now, ASSUMED_SESSION_MS) }
+            }
+            saveAsync()
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "noteLaunch failed: ${e.message}")
         }
     }
 
-    /**
-     * One observed session. Weighted by dwell: a two-second open is usually a misfire or a
-     * pass-through on the way somewhere else, and counting it the same as a ten-minute session
-     * is what makes naive frequency models keep suggesting apps you immediately back out of.
-     */
-    private fun record(pkg: String, startedAt: Long, durationMs: Long, prev: String?) {
-        val weight = min(1.0, durationMs.toDouble() / FULL_WEIGHT_MS)
-        // Graded before the dwell gate, not after. Opening something for two seconds is a poor
-        // sample of what you use, which is why it does not count toward the histogram — but it
-        // is a perfectly clear statement that you did not want what was offered, and that is a
-        // different question. Gating the verdict on dwell meant a guess you visibly declined
-        // was thrown away along with the session.
-        grade(pkg, startedAt, weight >= MIN_WEIGHT)
-        if (weight < MIN_WEIGHT) return
-        val st = stats.getOrPut(pkg) { Stat() }
-        st.launches += weight
-        st.totalMs += durationMs
-        if (startedAt > st.lastUsed) st.lastUsed = startedAt
-        val slot = slotOf(startedAt)
-        st.slots[slot] = (st.slots[slot] ?: 0.0) + weight
-        if (prev != null && prev != pkg) {
-            val m = transitions.getOrPut(prev) { ConcurrentHashMap() }
-            m[pkg] = (m[pkg] ?: 0.0) + weight
+    /** One session, folded into the episode stream. Caller holds [lock]. */
+    private fun record(pkg: String, startedAt: Long, durationMs: Long) {
+        accept(pkg, startedAt)
+        days.add(dayOf(startedAt))
+        if (durationMs < MIN_DWELL_MS) return
+        // Fold into the open episode for this app if it is recent enough. Scanning back from
+        // the end is short: the list is time-ordered and only the last few hours can match.
+        for (i in episodes.indices.reversed()) {
+            val e = episodes[i]
+            if (startedAt - (e.t + e.d) > EPISODE_GAP_MS) break
+            if (e.pkg == pkg) {
+                e.d = maxOf(e.d, startedAt + durationMs - e.t)
+                return
+            }
         }
+        val led = lastNotif[pkg]?.any { it in (startedAt - NOTIF_LEAD_MS)..startedAt } == true
+        episodes.add(Episode(pkg, startedAt, durationMs, led, placeAt(startedAt)))
     }
 
-    // ---- reinforcement ------------------------------------------------------------------------
+    // ---- place --------------------------------------------------------------------------------
 
     /**
-     * Grades the outstanding guess against what you actually opened. Called from [record], so
-     * it sees launches from both sources — including ones made outside this launcher entirely.
-     *
-     * Rewarding the app you chose matters as much as penalising the one that was named: the
-     * whole failure mode is a popular app crowding out the right one in a slot it owns, and
-     * only a positive term on the chosen app fixes that. Both are clamped so a run of unusual
-     * days can bend the ranking without overwriting what the counts know.
+     * Where the phone is right now, as a short opaque key: the Wi-Fi network if on one (hashed —
+     * the name itself is never stored), else a ~1 km grid cell from the last fix if it is
+     * fresh, else "" for unknown. Passive only: the last known location costs no battery.
      */
-    private fun grade(launched: String, at: Long, substantial: Boolean) {
-        val p = pending ?: return
-        val dt = at - p.at
-        // Outside the window this is just the next thing you happened to do, not an answer.
-        if (dt < 0 || dt > REWARD_WINDOW_MS) { if (dt > REWARD_WINDOW_MS) pending = null; return }
-        pending = null
-        if (launched == p.pkg) {
-            // Taking the suggestion and bouncing straight back out is not an endorsement.
-            if (substantial) nudge(p.pkg, p.slot, ACCEPT_LR)
-        } else {
-            // The penalty always lands: whatever you did instead, you did not want this one.
-            nudge(p.pkg, p.slot, -REJECT_LR)
-            // The credit does not, unless you actually stayed — otherwise a mis-tap on the way
-            // somewhere else teaches the model to offer the thing you mis-tapped.
-            if (substantial) nudge(launched, p.slot, ALT_LR)
+    private fun currentPlace(now: Long): String {
+        val st = try { act.status.last } catch (e: Throwable) { null }
+        val ssid = st?.optString("ssid", "") ?: ""
+        if (ssid.isNotEmpty()) return "w" + Integer.toHexString(ssid.hashCode())
+        if (ContextCompat.checkSelfPermission(act, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) return ""
+        return try {
+            val lm = act.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val fix = listOf(LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER, LocationManager.GPS_PROVIDER)
+                .mapNotNull { try { lm.getLastKnownLocation(it) } catch (e: SecurityException) { null } }
+                .maxByOrNull { it.time } ?: return ""
+            if (now - fix.time > PLACE_FIX_MAX_AGE_MS) return ""
+            "g" + (fix.latitude * CELL_PER_DEG).roundToInt() + "," + (fix.longitude * CELL_PER_DEG).roundToInt()
+        } catch (e: Throwable) { "" }
+    }
+
+    private fun samplePlace(now: Long) {
+        val p = currentPlace(now)
+        if (p.isEmpty()) return
+        val last = placeLog.lastOrNull()
+        if (last != null && last.second == p && now - last.first < PLACE_SAMPLE_MS) return
+        placeLog.add(now to p)
+    }
+
+    /** Nearest place sample to [t], or "" if none is close enough to vouch for it. */
+    private fun placeAt(t: Long): String {
+        var best = ""; var bestDt = PLACE_MATCH_MS
+        for ((ts, p) in placeLog) {
+            val dt = kotlin.math.abs(ts - t)
+            if (dt <= bestDt) { bestDt = dt; best = p }
         }
+        return best
     }
 
-    private fun nudge(pkg: String, slot: Int, delta: Double) {
-        val m = bias.getOrPut(pkg) { ConcurrentHashMap() }
-        val v = (m[slot] ?: 0.0) + delta
-        m[slot] = v.coerceIn(-BIAS_CLAMP, BIAS_CLAMP)
-    }
+    // ---- mining -------------------------------------------------------------------------------
 
-    private fun biasOf(pkg: String, slot: Int): Double = bias[pkg]?.get(slot) ?: 0.0
+    /** Re-derives every routine from the episode log. Caller holds [lock]. */
+    private fun mine(now: Long): List<Routine> {
+        val from = dayOf(now) - MINE_DAYS
+        val obs = days.filter { it >= from }
+        if (obs.size < MIN_DAYS) return emptyList()
+        val byPkg = HashMap<String, MutableList<Episode>>()
+        for (e in episodes) if (!e.led && dayOf(e.t) >= from) byPkg.getOrPut(e.pkg) { ArrayList() }.add(e)
+
+        val out = ArrayList<Routine>()
+        for ((pkg, eps) in byPkg) {
+            if (eps.size < MIN_DAYS || neverSuggest(pkg) || isAmbient(eps, obs.size)) continue
+            // Per 15-minute bin, the days with an episode starting there — smeared one bin
+            // either side, since a habit sits in a window, not on a clock edge.
+            val bins = Array(BINS) { HashSet<Int>() }
+            for (e in eps) {
+                val b = minuteOf(e.t) / BIN_MIN
+                val d = dayOf(e.t)
+                for (k in -1..1) bins[(b + k + BINS) % BINS].add(d)
+            }
+            val used = BooleanArray(BINS)
+            for (b in (0 until BINS).sortedByDescending { bins[it].size }) {
+                if (used[b] || bins[b].size < 2) continue
+                var lo = b; var hi = b
+                val floor = maxOf(2.0, GROW_FRACTION * bins[b].size)
+                while (hi - lo + 1 < MAX_WINDOW_BINS) {
+                    val l = lo - 1; val h = hi + 1
+                    val okL = l >= 0 && !used[l] && bins[l].size >= floor
+                    val okH = h < BINS && !used[h] && bins[h].size >= floor
+                    if (!okL && !okH) break
+                    if (okL && (!okH || bins[l].size >= bins[h].size)) lo = l else hi = h
+                }
+                for (k in maxOf(0, lo - 2)..minOf(BINS - 1, hi + 2)) used[k] = true
+                val loM = lo * BIN_MIN; val hiM = (hi + 1) * BIN_MIN
+                val inWin = eps.filter { minuteOf(it.t) in loM until hiM }
+                val hitDays = inWin.map { dayOf(it.t) }.toSet()
+                if (hitDays.size < MIN_DAYS) continue
+                val lift = (inWin.size.toDouble() / (hi - lo + 1)) / (eps.size.toDouble() / BINS)
+                if (lift < MIN_LIFT) continue
+                val places = HashMap<String, Int>()
+                for (e in inWin) if (e.place.isNotEmpty()) places[e.place] = (places[e.place] ?: 0) + 1
+                out.add(Routine(pkg, loM, hiM, hitDays, places, lift))
+            }
+        }
+        return out
+    }
 
     /**
-     * Forms a guess without showing one, so the loop keeps turning while the widget is off:
-     * the model still commits to an answer and still gets graded on it. Turning the widget
-     * back on then gets a predictor that has been learning all along, not one starting cold.
+     * Used on most days, spread across most of each day: a habit, not a routine. Suggesting it
+     * is noise at best and a nudge to open it at worst.
      */
-    private fun formHypothesis() {
-        val best = bestCandidate() ?: return
-        placeBet(best.pkg)
+    private fun isAmbient(eps: List<Episode>, obsDays: Int): Boolean {
+        val blocks = HashMap<Int, HashSet<Int>>()
+        for (e in eps) blocks.getOrPut(dayOf(e.t)) { HashSet() }.add(minuteOf(e.t) / 120)
+        if (blocks.size < AMBIENT_DAY_SHARE * obsDays) return false
+        return blocks.values.sumOf { it.size }.toDouble() / blocks.size >= AMBIENT_BLOCKS
     }
 
-    /**
-     * Records the bet, but never on top of one that is still owed an answer. predict() runs
-     * from the UI as soon as the app list lands, which can easily beat the ingest that would
-     * have graded the previous bet — overwriting it there meant the verdict was discarded
-     * before it could be read, and the correction term never moved at all.
-     */
-    private fun placeBet(pkg: String) {
-        val now = System.currentTimeMillis()
-        val open = pending
-        if (open != null && now - open.at <= REWARD_WINDOW_MS) return   // still awaiting a verdict
-        pending = Pending(pkg, slotOf(now), now)
-        saveAsync()
+    /** Feeds and system plumbing: never worth an unprompted offer, whatever the counts say. */
+    private fun neverSuggest(pkg: String): Boolean {
+        if (pkg in NEVER) return true
+        if (Build.VERSION.SDK_INT < 26) return false
+        return try {
+            when (act.packageManager.getApplicationInfo(pkg, 0).category) {
+                ApplicationInfo.CATEGORY_SOCIAL, ApplicationInfo.CATEGORY_VIDEO,
+                ApplicationInfo.CATEGORY_GAME, ApplicationInfo.CATEGORY_NEWS -> true
+                else -> false
+            }
+        } catch (e: Throwable) { false }
     }
 
     // ---- prediction -------------------------------------------------------------------------
 
     /**
-     * Best guess for right now, as JSON for the UI, or `{}` when nothing clears the bar.
-     * Returning nothing is a normal outcome and the common one at odd hours — a launcher that
-     * always shows a suggestion trains you to ignore the suggestion.
+     * The suggestion for right now, as JSON for the UI, or `{}` — the normal answer. Only a
+     * live routine with enough support is ever named.
      */
     fun predict(): String {
         return try {
             ensureLoaded()
-            // refresh() also tries this, but it runs from onResume and routinely beats the
-            // async app-list build, then the rate limit locks it out for five minutes. By the
-            // time anything asks for a prediction the labels are necessarily there.
-            if (purgeIgnored()) saveAsync()
-            val best = bestCandidate()
-            // One line per ask: "is the model empty, is nothing clearing the bar, or is the
-            // UI simply not drawing what it was given" is otherwise guesswork from outside.
-            android.util.Log.d(TAG, if (best == null) "no candidate (apps=${stats.size})"
-                       else "suggest ${best.pkg} confidence=${"%.2f".format(best.score)}")
+            val best = synchronized(lock) { bestRoutine(System.currentTimeMillis()) }
+            android.util.Log.d(TAG, if (best == null) "quiet (routines=${routines.size})"
+                       else "suggest ${best.first.pkg} window=${hhmm(best.first.lo)}-${hhmm(best.first.hi)} support=${"%.2f".format(best.second)}")
             if (best == null) return "{}"
-            // Naming an app IS the action the policy took, so this is where the bet is placed;
-            // record() grades it against whatever gets opened next. Written out immediately
-            // (off-thread): the launcher is usually killed between placing the bet and seeing
-            // it answered, so a bet only held in memory is one the model never learns from.
-            placeBet(best.pkg)
+            val r = best.first
             JSONObject()
-                .put("pkg", best.pkg)
-                .put("label", best.label)
-                .put("score", best.score)
-                .put("icon", IconDots.encode(act, best.pkg, ICON_DOTS))
+                .put("pkg", r.pkg)
+                .put("label", act.bridge.labelFor(r.pkg) ?: return "{}")
+                .put("score", best.second)
+                .put("until", hhmm(r.hi))
+                .put("icon", IconDots.encode(act, r.pkg, ICON_DOTS))
                 .toString()
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "predict failed: ${e.message}")
@@ -343,146 +373,152 @@ class AppPredictor(private val act: MainActivity) {
         }
     }
 
-    private class Candidate(val pkg: String, val label: String, val score: Double)
-
-    private fun bestCandidate(): Candidate? {
-        val now = System.currentTimeMillis()
-        val slot = slotOf(now)
-        val prevSlot = neighbourSlot(slot, -1)
-        val nextSlot = neighbourSlot(slot, +1)
-
-        val totalLaunches = stats.values.sumOf { it.launches }
-        if (totalLaunches < MIN_TOTAL_LAUNCHES) return null   // not enough history to be useful
-
-        val fromLast = lastPkg?.let { transitions[it] }
-        val fromLastTotal = fromLast?.values?.sum() ?: 0.0
-        // Null before StatusMonitor exists or before its first push; the context nudges just
-        // sit out until then. `lateinit` access throws rather than returning null from here.
-        val st = try { act.status.last } catch (e: Throwable) { null }
-        val headphones = st?.optBoolean("audio", false) == true || st?.optBoolean("btAudio", false) == true
-        val charging = st?.optBoolean("charging", false) == true
-
-        var bestPkg: String? = null
-        var bestLabel: String? = null
-        var bestScore = Double.NEGATIVE_INFINITY
-        val scores = ArrayList<Double>(stats.size)
-
-        for ((pkg, s) in stats) {
-            if (s.launches < MIN_APP_LAUNCHES) continue
-            // Also filtered here, not just at ingest: a package already in the model from an
-            // earlier build — or one that became a launcher since — would otherwise keep
-            // being offered until decay finally forgot it.
-            if (ignored(pkg)) continue
-            // Resolved up front, not after picking a winner: an app uninstalled since it was
-            // logged should lose to the runner-up, not suppress the suggestion entirely.
-            val label = act.bridge.labelFor(pkg) ?: continue
-            // Just came back from it — suggesting it again is noise, not prediction.
-            if (now - s.lastUsed < SUPPRESS_RECENT_MS) continue
-
-            // P(app), smoothed.
-            val prior = ln((s.launches + PRIOR_ALPHA) / (totalLaunches + PRIOR_ALPHA * stats.size))
-
-            // P(this time slot | app). Adjacent hours count partially: habits sit in a window,
-            // not on a clock edge, and without the bleed an app used at 08:58 daily scores zero
-            // at 09:01.
-            val slotHits = (s.slots[slot] ?: 0.0) +
-                ADJACENT * ((s.slots[prevSlot] ?: 0.0) + (s.slots[nextSlot] ?: 0.0))
-            val pSlot = ln((slotHits + SLOT_ALPHA) / (s.launches + SLOT_ALPHA * SLOTS))
-
-            // P(app | app you just left). Strong signal when present, absent most of the time.
-            val trans = if (fromLastTotal > 0) {
-                ln(((fromLast?.get(pkg) ?: 0.0) + TRANS_ALPHA) / (fromLastTotal + TRANS_ALPHA * stats.size))
-            } else 0.0
-
-            // The learned correction is added raw, not weighted: it is already in score units
-            // and is the one term that reflects your verdict rather than your history.
-            var score = W_PRIOR * prior + W_SLOT * pSlot + W_TRANS * trans + biasOf(pkg, slot)
-
-            // Cheap contextual nudges from state the launcher already tracks. Headphones or a
-            // Bluetooth speaker going live is the single most predictive non-temporal signal
-            // there is for "about to play something".
-            if (headphones && looksLikeMedia(pkg)) score += W_CONTEXT
-            if (charging && s.avgMs() > LONG_SESSION_MS) score += W_CONTEXT * 0.5
-
-            scores.add(score)
-            if (score > bestScore) { bestScore = score; bestPkg = pkg; bestLabel = label }
+    private fun bestRoutine(now: Long): Pair<Routine, Double>? {
+        val today = dayOf(now)
+        val minute = minuteOf(now)
+        val here = currentPlace(now)
+        val waiting = MediaListenerService.notifPkgs
+        val obs = days.filter { it >= today - MINE_DAYS && it != today }
+        var best: Pair<Routine, Double>? = null
+        for (r in routines) {
+            if (minute < r.lo - LEAD_MIN || minute >= r.hi) continue
+            if ((muted[r.key] ?: 0L) > now) continue
+            if (ignoredOn(today, r.key) >= MAX_IGNORED) continue
+            // The shade is already offering it; a second offer is just a second nudge.
+            if (r.pkg in waiting) continue
+            if (act.bridge.labelFor(r.pkg) == null || ignored(r.pkg)) continue
+            // Done it already in this window today: the routine is satisfied.
+            if (episodes.any { it.pkg == r.pkg && dayOf(it.t) == today && minuteOf(it.t) >= r.lo - LEAD_MIN && minuteOf(it.t) < r.hi }) continue
+            var s = support(r, today, obs)
+            s *= placeFactor(r, here)
+            if (s < SHOW_MIN) continue
+            if (best == null || s > best.second) best = r to s
         }
-
-        val pkg = bestPkg ?: return null
-        // Confidence, not a raw cutoff. The score is a sum of log terms whose scale moves with
-        // how many apps are installed and how many launches are on record, so any absolute
-        // threshold means something different on every phone — and drifted past its own cutoff
-        // here after a handful of launches. A softmax over the candidates asks the question
-        // that actually matters: given everything else it could have said, how much of the
-        // probability mass is on this one? Scale-free, and directly interpretable.
-        var sum = 0.0
-        for (v in scores) sum += Math.exp(v - bestScore)   // shifted: the max term is exp(0)=1
-        val confidence = if (sum > 0) 1.0 / sum else 0.0
-        if (confidence < MIN_CONFIDENCE) return null
-        return Candidate(pkg, bestLabel ?: return null, confidence)
+        return best
     }
 
-    private fun Stat.avgMs(): Double = if (launches > 0) totalMs / launches else 0.0
+    /**
+     * Share of comparable days the routine fired on. The same weekday is the sharpest context
+     * — office days and home days differ more than any hour does — but takes weeks to fill, so
+     * it is shrunk toward the weekday/weekend rate until it has, and both carry a pseudo-count
+     * so three days of evidence cannot claim certainty.
+     */
+    private fun support(r: Routine, today: Int, obs: List<Int>): Double {
+        val wd = weekdayOf(today)
+        val weekend = wd >= 5
+        val sameType = obs.filter { (weekdayOf(it) >= 5) == weekend }
+        if (sameType.isEmpty()) return 0.0
+        val hitsType = r.hitDays.count { (weekdayOf(it) >= 5) == weekend }
+        val sType = hitsType / (sameType.size + PRIOR_DAYS)
+        val sameWd = obs.count { weekdayOf(it) == wd }
+        val hitsWd = r.hitDays.count { weekdayOf(it) == wd }
+        return (hitsWd + WEEKDAY_SHRINK * sType) / (sameWd + WEEKDAY_SHRINK)
+    }
 
-    private fun looksLikeMedia(pkg: String): Boolean =
-        MEDIA_HINTS.any { pkg.contains(it, ignoreCase = true) }
+    /**
+     * Place as a gate, once the routine has enough placed evidence to have one. Somewhere it
+     * has never happened mostly vetoes it — the evening ride home is not needed from home —
+     * and its usual place lends a little confidence. Unknown place is neutral.
+     */
+    private fun placeFactor(r: Routine, here: String): Double {
+        val total = r.places.values.sum()
+        if (here.isEmpty() || total < MIN_PLACED) return 1.0
+        val share = (r.places[here] ?: 0).toDouble() / total
+        return when {
+            share == 0.0 -> PLACE_VETO
+            share >= 0.5 -> PLACE_BOOST
+            else -> 1.0
+        }
+    }
+
+    // ---- feedback ---------------------------------------------------------------------------
+
+    /**
+     * The UI actually put [pkg] on screen. Called once per offer (an unlock or a return home),
+     * not per refresh, so "ignored" means a real look that was passed over.
+     */
+    fun noteShown(pkg: String) {
+        try {
+            ensureLoaded()
+            val now = System.currentTimeMillis()
+            synchronized(lock) {
+                val r = routines.firstOrNull { it.pkg == pkg && minuteOf(now) in (it.lo - LEAD_MIN) until it.hi } ?: return
+                val prev = lastShown
+                if (prev != null && !prev.accepted && now - prev.at > ACCEPT_WINDOW_MS) passOver(prev, now)
+                if (prev != null && prev.key == r.key && !prev.accepted && now - prev.at <= ACCEPT_WINDOW_MS) return
+                lastShown = Shown(pkg, r.key, now)
+                val v = verdict.getOrPut(r.key) { DoubleArray(2) }
+                v[0] += 1.0
+            }
+            saveAsync()
+        } catch (e: Throwable) {
+            android.util.Log.w(TAG, "noteShown failed: ${e.message}")
+        }
+    }
+
+    /** Double-tap on the suggestion: not wanted. Mutes that routine, not the app. */
+    fun dismiss(pkg: String) {
+        try {
+            ensureLoaded()
+            val now = System.currentTimeMillis()
+            synchronized(lock) {
+                val key = lastShown?.takeIf { it.pkg == pkg }?.key
+                    ?: routines.firstOrNull { it.pkg == pkg && minuteOf(now) in (it.lo - LEAD_MIN) until it.hi }?.key
+                    ?: return
+                muted[key] = now + MUTE_MS
+                lastShown = null
+            }
+            saveAsync()
+        } catch (e: Throwable) {}
+    }
+
+    private fun accept(pkg: String, at: Long) {
+        val s = lastShown ?: return
+        if (s.accepted || s.pkg != pkg || at < s.at || at - s.at > ACCEPT_WINDOW_MS) return
+        s.accepted = true
+        verdict.getOrPut(s.key) { DoubleArray(2) }[1] += 1.0
+    }
+
+    private fun passOver(s: Shown, now: Long) {
+        val today = dayOf(now)
+        ignoredOn(today, s.key)
+        ignoredToday[s.key] = (ignoredToday[s.key] ?: 0) + 1
+        // Ignored for weeks: this window is not one you want offered, whatever the counts say.
+        val v = verdict[s.key] ?: return
+        if (v[0] >= MUTE_AFTER_SHOWN && v[1] / v[0] < MUTE_BELOW_RATE) {
+            muted[s.key] = now + MUTE_MS
+            v[0] = 0.0; v[1] = 0.0
+        }
+    }
+
+    private fun ignoredOn(today: Int, key: String): Int {
+        if (ignoredDay != today) { ignoredToday.clear(); ignoredDay = today }
+        return ignoredToday[key] ?: 0
+    }
 
     // ---- housekeeping -------------------------------------------------------------------------
 
-    /**
-     * Exponential decay so the model tracks habits that change. Without it, an app you opened
-     * constantly six months ago and never since outranks the one you actually use now, forever.
-     */
-    private fun decayIfNeeded(now: Long) {
-        val day = now / 86_400_000L
-        if (lastDecayDay == 0L) { lastDecayDay = day; return }
-        val days = (day - lastDecayDay).toInt()
-        if (days <= 0) return
-        val f = Math.pow(DAILY_DECAY, days.toDouble())
-        val dead = ArrayList<String>()
-        for ((pkg, s) in stats) {
-            s.launches *= f
-            s.totalMs *= f
-            for ((k, v) in s.slots) s.slots[k] = v * f
-            s.slots.entries.removeAll { it.value < FORGET_BELOW }
-            if (s.launches < FORGET_BELOW) dead.add(pkg)
-        }
-        // Drop what has decayed to nothing, so the file cannot grow without bound.
-        for (p in dead) { stats.remove(p); transitions.remove(p) }
-        for (m in transitions.values) {
-            for ((k, v) in m) m[k] = v * f
-            m.entries.removeAll { it.value < FORGET_BELOW || !stats.containsKey(it.key) }
-        }
-        // Corrections fade faster than counts. A verdict is about how things are now, and a
-        // penalty earned months ago should not still be suppressing an app you have since
-        // started using — the counts are the long memory, this is the short one.
-        val bf = Math.pow(BIAS_DECAY, days.toDouble())
-        for ((pkg, m) in bias) {
-            for ((k, v) in m) m[k] = v * bf
-            m.entries.removeAll { kotlin.math.abs(it.value) < BIAS_FORGET }
-            if (m.isEmpty() || !stats.containsKey(pkg)) bias.remove(pkg)
-        }
-        lastDecayDay = day
+    private fun prune(now: Long) {
+        val cutoff = now - KEEP_MS
+        episodes.removeAll { it.t < cutoff }
+        val dayCut = dayOf(cutoff)
+        days.removeAll { it < dayCut }
+        placeLog.removeAll { it.first < now - PLACE_LOG_MS }
+        for (l in lastNotif.values) l.removeAll { it < now - NOTIF_LEAD_MS - EPISODE_GAP_MS }
+        lastNotif.entries.removeAll { it.value.isEmpty() }
+        muted.entries.removeAll { it.value < now }
     }
 
-    /**
-     * Drops anything that should never have been learned — this launcher, other home apps,
-     * packages since uninstalled. Filtering these at read time is not enough: they stay in
-     * `totalLaunches`, which is the denominator of every app's prior, so a launcher sitting on
-     * a tenth of all recorded launches quietly deflates the score of every real candidate.
-     * Guarded on labelsReady so an empty label map cannot be read as "nothing is launchable"
-     * and wipe the model.
-     */
-    private fun purgeIgnored(): Boolean {
-        if (!act.bridge.labelsReady()) return false
-        val dead = stats.keys.filter { ignored(it) }
-        if (dead.isEmpty()) return false
-        val deadSet = dead.toSet()
-        for (p in dead) { stats.remove(p); transitions.remove(p); bias.remove(p) }
-        for (m in transitions.values) m.keys.removeAll(deadSet)
-        pending?.let { if (it.pkg in deadSet) pending = null }
-        android.util.Log.d(TAG, "purged ${dead.size} untrackable: ${dead.take(4)}")
-        return true
+    /** Verdicts fade, so a routine you ignored last month gets another chance. */
+    private fun decayIfNeeded(now: Long) {
+        val day = dayOf(now)
+        if (lastDecayDay == 0) { lastDecayDay = day; return }
+        val n = day - lastDecayDay
+        if (n <= 0) return
+        val f = Math.pow(VERDICT_DECAY, n.toDouble())
+        for (v in verdict.values) { v[0] *= f; v[1] *= f }
+        verdict.entries.removeAll { it.value[0] < 0.05 }
+        lastDecayDay = day
     }
 
     /**
@@ -496,107 +532,76 @@ class AppPredictor(private val act: MainActivity) {
             act.bridge.isHomeApp(pkg) ||   // another launcher: never a useful suggestion
             (act.bridge.labelsReady() && act.bridge.labelFor(pkg) == null)
 
-    private fun slotOf(ms: Long): Int {
-        val c = Calendar.getInstance()
-        c.timeInMillis = ms
-        val dow = c.get(Calendar.DAY_OF_WEEK)
-        val weekend = if (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) 1 else 0
-        return weekend * 24 + c.get(Calendar.HOUR_OF_DAY)
-    }
-
-    /** Hour-of-day wraps within its own day type; midnight's neighbour is 23:00, not a weekend. */
-    private fun neighbourSlot(slot: Int, delta: Int): Int {
-        val dayType = slot / 24
-        val hour = (slot % 24 + delta + 24) % 24
-        return dayType * 24 + hour
-    }
+    // Local calendar. Day numbers are local, not UTC, so "today" turns over at your midnight.
+    private fun localMs(ms: Long) = ms + TimeZone.getDefault().getOffset(ms)
+    private fun dayOf(ms: Long): Int = localMs(ms).floorDiv(86_400_000L).toInt()
+    private fun minuteOf(ms: Long): Int = (localMs(ms).mod(86_400_000L) / 60_000L).toInt()
+    /** 0 = Monday .. 6 = Sunday. Day 0 of the epoch was a Thursday. */
+    private fun weekdayOf(day: Int): Int = (day + 3).mod(7)
+    private fun hhmm(m: Int) = "%02d:%02d".format((m / 60) % 24, m % 60)
 
     // ---- persistence ---------------------------------------------------------------------------
 
-    @Synchronized
     private fun ensureLoaded() {
-        if (loaded) return
-        loaded = true
-        val f = file
-        if (!f.exists()) return
-        try {
-            val root = JSONObject(f.readText())
-            lastEventTs = root.optLong("lastEventTs", 0L)
-            recordedUpTo = root.optLong("recordedUpTo", 0L)
-            lastDecayDay = root.optLong("lastDecayDay", 0L)
-            lastPkg = root.optString("lastPkg", "").ifEmpty { null }
-            val apps = root.optJSONObject("apps") ?: JSONObject()
-            for (pkg in apps.keys()) {
-                val o = apps.getJSONObject(pkg)
-                val s = Stat()
-                s.launches = o.optDouble("n", 0.0)
-                s.totalMs = o.optDouble("ms", 0.0)
-                s.lastUsed = o.optLong("last", 0L)
-                val sl = o.optJSONObject("slots") ?: JSONObject()
-                for (k in sl.keys()) s.slots[k.toInt()] = sl.getDouble(k)
-                stats[pkg] = s
+        synchronized(lock) {
+            if (loaded) return
+            loaded = true
+            // The frequency model's file is useless to this one; it only wastes storage.
+            try { if (legacyFile.exists()) legacyFile.delete() } catch (e: Throwable) {}
+            val f = file
+            if (!f.exists()) return
+            try {
+                val root = JSONObject(f.readText())
+                if (root.optInt("v", 0) != FORMAT) return
+                lastEventTs = root.optLong("lastEventTs", 0L)
+                recordedUpTo = root.optLong("recordedUpTo", 0L)
+                lastDecayDay = root.optInt("lastDecayDay", 0)
+                val ep = root.optJSONArray("eps") ?: JSONArray()
+                for (i in 0 until ep.length()) {
+                    val a = ep.getJSONArray(i)
+                    episodes.add(Episode(a.getString(0), a.getLong(1), a.getLong(2), a.getInt(3) == 1, a.optString(4, "")))
+                }
+                val ds = root.optJSONArray("days") ?: JSONArray()
+                for (i in 0 until ds.length()) days.add(ds.getInt(i))
+                val ln = root.optJSONObject("notif") ?: JSONObject()
+                for (k in ln.keys()) {
+                    val a = ln.optJSONArray(k) ?: continue
+                    lastNotif[k] = ArrayList<Long>().apply { for (i in 0 until a.length()) add(a.getLong(i)) }
+                }
+                val pl = root.optJSONArray("places") ?: JSONArray()
+                for (i in 0 until pl.length()) { val a = pl.getJSONArray(i); placeLog.add(a.getLong(0) to a.getString(1)) }
+                val mu = root.optJSONObject("muted") ?: JSONObject()
+                for (k in mu.keys()) muted[k] = mu.getLong(k)
+                val vd = root.optJSONObject("verdict") ?: JSONObject()
+                for (k in vd.keys()) { val a = vd.getJSONArray(k); verdict[k] = doubleArrayOf(a.getDouble(0), a.getDouble(1)) }
+                routines = mine(System.currentTimeMillis())
+            } catch (e: Throwable) {
+                // A corrupt model is not worth a crash or a migration path — start over.
+                android.util.Log.w(TAG, "model unreadable, starting fresh: ${e.message}")
+                episodes.clear(); days.clear(); lastEventTs = 0L; recordedUpTo = 0L
             }
-            val tr = root.optJSONObject("trans") ?: JSONObject()
-            for (from in tr.keys()) {
-                val o = tr.getJSONObject(from)
-                val m = ConcurrentHashMap<String, Double>()
-                for (to in o.keys()) m[to] = o.getDouble(to)
-                transitions[from] = m
-            }
-            val pp = root.optString("pendPkg", "")
-            val ps = root.optInt("pendSlot", -1)
-            val pa = root.optLong("pendAt", 0L)
-            if (pp.isNotEmpty() && ps >= 0 && pa > 0) pending = Pending(pp, ps, pa)
-            val bi = root.optJSONObject("bias") ?: JSONObject()
-            for (pkg in bi.keys()) {
-                val o = bi.getJSONObject(pkg)
-                val m = ConcurrentHashMap<Int, Double>()
-                for (k in o.keys()) m[k.toInt()] = o.getDouble(k)
-                bias[pkg] = m
-            }
-        } catch (e: Throwable) {
-            // A corrupt model is not worth a crash or a migration path — start over.
-            android.util.Log.w(TAG, "model unreadable, starting fresh: ${e.message}")
-            stats.clear(); transitions.clear()
         }
     }
 
-    @Synchronized
     private fun save() {
         try {
-            val apps = JSONObject()
-            for ((pkg, s) in stats) {
-                val sl = JSONObject()
-                for ((k, v) in s.slots) sl.put(k.toString(), v)
-                apps.put(pkg, JSONObject()
-                    .put("n", s.launches).put("ms", s.totalMs)
-                    .put("last", s.lastUsed).put("slots", sl))
+            val text = synchronized(lock) {
+                val ep = JSONArray()
+                for (e in episodes) ep.put(JSONArray().put(e.pkg).put(e.t).put(e.d).put(if (e.led) 1 else 0).put(e.place))
+                val ln = JSONObject(); for ((k, v) in lastNotif) ln.put(k, JSONArray(v))
+                val pl = JSONArray(); for ((t, p) in placeLog) pl.put(JSONArray().put(t).put(p))
+                val mu = JSONObject(); for ((k, v) in muted) mu.put(k, v)
+                val vd = JSONObject(); for ((k, v) in verdict) vd.put(k, JSONArray().put(v[0]).put(v[1]))
+                JSONObject()
+                    .put("v", FORMAT)
+                    .put("lastEventTs", lastEventTs)
+                    .put("recordedUpTo", recordedUpTo)
+                    .put("lastDecayDay", lastDecayDay)
+                    .put("eps", ep).put("days", JSONArray(days.toList()))
+                    .put("notif", ln).put("places", pl).put("muted", mu).put("verdict", vd)
+                    .toString()
             }
-            val tr = JSONObject()
-            for ((from, m) in transitions) {
-                val o = JSONObject()
-                for ((to, v) in m) o.put(to, v)
-                tr.put(from, o)
-            }
-            val bi = JSONObject()
-            for ((pkg, m) in bias) {
-                val o = JSONObject()
-                for ((slot, v) in m) o.put(slot.toString(), v)
-                bi.put(pkg, o)
-            }
-            file.writeText(JSONObject()
-                .put("lastEventTs", lastEventTs)
-                .put("recordedUpTo", recordedUpTo)
-                .put("lastDecayDay", lastDecayDay)
-                .put("lastPkg", lastPkg ?: "")
-                .put("apps", apps).put("trans", tr).put("bias", bi)
-                // The outstanding bet outlives the process on purpose: the launcher is
-                // routinely killed while you are inside the very app that would answer it,
-                // and a verdict lost to that is a verdict the model never learns from.
-                .put("pendPkg", pending?.pkg ?: "")
-                .put("pendSlot", pending?.slot ?: -1)
-                .put("pendAt", pending?.at ?: 0L)
-                .toString())
+            file.writeText(text)
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "save failed: ${e.message}")
         }
@@ -604,63 +609,70 @@ class AppPredictor(private val act: MainActivity) {
 
     /** Settings "forget everything" — the model is behavioural data, so this has to exist. */
     fun clear() {
-        stats.clear(); transitions.clear(); bias.clear()
-        lastEventTs = 0L; recordedUpTo = 0L; lastDecayDay = 0L; lastPkg = null; pending = null
-        try { file.delete() } catch (e: Throwable) {}
+        synchronized(lock) {
+            episodes.clear(); days.clear(); lastNotif.clear(); placeLog.clear()
+            muted.clear(); verdict.clear(); ignoredToday.clear()
+            routines = emptyList(); lastShown = null
+            lastEventTs = 0L; recordedUpTo = 0L; lastDecayDay = 0
+        }
+        try { file.delete(); legacyFile.delete() } catch (e: Throwable) {}
     }
 
     companion object {
         private const val TAG = "ZrnPredict"
-
-        /** 2 day types (weekday/weekend) x 24 hours. */
-        private const val SLOTS = 48
+        private const val FORMAT = 2
         private const val ICON_DOTS = 20
+        /** UsageEvents.Event.NOTIFICATION_INTERRUPTION, which is @hide. */
+        private const val EVENT_NOTIFICATION_INTERRUPTION = 12
 
-        // Ingest shaping.
-        private const val FULL_WEIGHT_MS = 30_000.0      // a session this long counts fully
-        private const val MIN_WEIGHT = 0.05              // below this it was a pass-through
-        private const val ASSUMED_SESSION_MS = 60_000L   // own-log fallback, duration unobservable
-        private const val LONG_SESSION_MS = 5 * 60_000.0
-
-        // Scoring weights. Time-of-day dominates, which is the whole premise; the prior stops
-        // a once-used app winning its slot outright; transitions matter but are usually absent.
-        private const val W_PRIOR = 1.0
-        private const val W_SLOT = 2.2
-        private const val W_TRANS = 0.8
-        private const val W_CONTEXT = 0.6
-        private const val ADJACENT = 0.45                // weight of the hours either side
-
-        // Laplace smoothing, so an unseen combination is unlikely rather than impossible.
-        private const val PRIOR_ALPHA = 1.0
-        private const val SLOT_ALPHA = 0.6
-        private const val TRANS_ALPHA = 0.4
-
-        // Bars for showing anything at all.
-        private const val MIN_TOTAL_LAUNCHES = 12.0
-        private const val MIN_APP_LAUNCHES = 2.0
-        /** Share of the probability mass the winner must hold. ~1-in-4 or better. */
-        private const val MIN_CONFIDENCE = 0.22
-        private const val SUPPRESS_RECENT_MS = 3 * 60_000L
-
-        private const val DAILY_DECAY = 0.985            // ~46-day half-life
-        private const val FORGET_BELOW = 0.05
-
-        // Reinforcement. Rates are deliberately large next to the counts: a few corrections
-        // should visibly move the ranking, which is the entire point of grading the guess
-        // rather than just counting launches. Accept outweighs reject so the model is not
-        // talked out of a good habit by one distracted morning.
-        private const val REWARD_WINDOW_MS = 90_000L     // a launch this soon is an answer
-        /** How far behind the present the event watermark is held. */
+        // Preprocessing.
+        private const val MIN_DWELL_MS = 5_000L              // shorter is a misfire or pass-through
+        private const val EPISODE_GAP_MS = 30 * 60_000L      // re-opens inside this are one episode
+        private const val NOTIF_LEAD_MS = 10 * 60_000L       // opened this soon after its notification
+        private const val NOTIF_KEEP = 16
+        private const val ASSUMED_SESSION_MS = 60_000L       // own-log fallback, duration unobservable
+        private const val BACKFILL_MS = 30L * 24 * 3600_000L
         private const val EVENT_LAG_MS = 60_000L
-        private const val ACCEPT_LR = 0.60               // named it, you opened it
-        private const val REJECT_LR = 0.35               // named it, you opened something else
-        private const val ALT_LR = 0.25                  // ...and what you opened instead
-        private const val BIAS_CLAMP = 2.5               // never allowed to overrule the counts
-        private const val BIAS_DECAY = 0.94              // ~11-day half-life: shorter memory
-        private const val BIAS_FORGET = 0.02
+        private const val KEEP_MS = 56L * 24 * 3600_000L     // eight weeks of episodes
 
-        private val MEDIA_HINTS = listOf(
-            "music", "spotify", "audio", "podcast", "player", "youtube", "soundcloud", "deezer"
+        // Mining. Thresholds tuned on the device's own ten days: looser let one-off camera and
+        // authenticator coincidences through, tighter lost the commute.
+        private const val MINE_DAYS = 42
+        private const val BIN_MIN = 15
+        private const val BINS = 1440 / BIN_MIN
+        private const val MAX_WINDOW_BINS = 12               // three hours
+        private const val GROW_FRACTION = 0.6
+        private const val MIN_DAYS = 3
+        private const val MIN_LIFT = 4.0
+        private const val AMBIENT_DAY_SHARE = 0.7
+        private const val AMBIENT_BLOCKS = 3.0               // distinct 2h blocks per active day
+
+        // Showing.
+        private const val LEAD_MIN = 30                      // offer this long before the window
+        private const val SHOW_MIN = 0.40
+        private const val PRIOR_DAYS = 2.0
+        private const val WEEKDAY_SHRINK = 2.0
+        private const val MAX_IGNORED = 2
+        private const val ACCEPT_WINDOW_MS = 3 * 60_000L
+        private const val MUTE_MS = 14L * 24 * 3600_000L
+        private const val MUTE_AFTER_SHOWN = 6.0
+        private const val MUTE_BELOW_RATE = 0.15
+        private const val VERDICT_DECAY = 0.97
+
+        // Place.
+        private const val CELL_PER_DEG = 100.0               // ~1.1 km cells
+        private const val PLACE_FIX_MAX_AGE_MS = 30 * 60_000L
+        private const val PLACE_SAMPLE_MS = 10 * 60_000L
+        private const val PLACE_MATCH_MS = 20 * 60_000L
+        private const val PLACE_LOG_MS = 2L * 24 * 3600_000L
+        private const val MIN_PLACED = 3
+        private const val PLACE_VETO = 0.3
+        private const val PLACE_BOOST = 1.2
+
+        private val NEVER = setOf(
+            "com.android.settings", "com.google.android.packageinstaller",
+            "com.google.android.permissioncontroller", "com.android.vending",
+            "com.google.android.documentsui", "com.google.android.gms"
         )
     }
 }
