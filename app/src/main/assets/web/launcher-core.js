@@ -124,19 +124,21 @@ const WARN_TRI = [
 const BATT_WARN = 25;
 const BATT_CRIT = 15;
 
-// Plug for the middle widget, 13x9, lying on its side with its prongs pointing into the
-// battery shell's left wall. A bolt at this resolution read as a stray diagonal; a plug
-// with two prongs and a cable is unmistakable even at a glance.
+// Plug for the middle widget, 8x11, standing upright in the middle of the battery shell:
+// prongs up, cable down. Even width so it centres exactly on the 22-dot shell. A bolt at
+// this resolution read as a stray diagonal; a plug is unmistakable even at a glance.
 const CHARGE_PLUG = [
-  '.....XXXX....',
-  '....XXXXXX...',
-  '....XXXXXXXXX',
-  '....XXXXXX...',
-  'XXXXXXXXXX...',
-  '....XXXXXX...',
-  '....XXXXXXXXX',
-  '....XXXXXX...',
-  '.....XXXX....'
+  '.X....X.',
+  '.X....X.',
+  '.X....X.',
+  'XXXXXXXX',
+  'XXXXXXXX',
+  'XXXXXXXX',
+  '.XXXXXX.',
+  '..XXXX..',
+  '...XX...',
+  '...XX...',
+  '...XX...'
 ];
 
 // Small upright plug beside the status-bar battery, 5x9 to match its height.
@@ -1901,9 +1903,7 @@ class Launcher {
   drawCharging(g, A, cy) {
     const st = this.status;
     const top = cy - 13;                                 // shell rows top..top+12
-    // Plug (13) + gap (1) + shell and nub (24), centred as one piece in the widget.
-    const px = MID_L + Math.floor((MID_R - MID_L + 1 - 38) / 2);
-    const bx = px + 14;
+    const bx = 22;
     g.frame(bx, top, bx + 21, top + 12, 1);
     g.vline(bx + 22, top + 4, top + 8, 1);
     g.vline(bx + 23, top + 4, top + 8, 1);
@@ -1914,7 +1914,19 @@ class Launcher {
         g.set(bx + 2 + c, r, c < have ? 1 : c < fill ? 3 : 0);
       }
     }
-    g.bmp(CHARGE_PLUG, px, top + 2, 9);                  // centred on the shell's middle row
+    // A one-dot dark ring cut into the fill first, so the plug reads against a full
+    // battery instead of merging into it. Kept inside the shell so the frame stays whole.
+    const px = bx + 7, py = top + 1;
+    for (let r = 0; r < CHARGE_PLUG.length; r++) {
+      for (let c = 0; c < CHARGE_PLUG[r].length; c++) {
+        if (CHARGE_PLUG[r][c] !== 'X') continue;
+        for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+          const x = px + c + dc, y = py + r + dr;
+          if (x > bx && x < bx + 21 && y > top && y < top + 12) g.set(x, y, 0);
+        }
+      }
+    }
+    g.bmp(CHARGE_PLUG, px, py, 9);
     g.text3fit('CHARGING', MID_L, MID_R, top + 18, 1, A);
     g.text3fit(st.batt >= 100 ? 'FULL' : 'PLUGGED IN ' + st.batt + '%', MID_L, MID_R, top + 25, 3, A);
   }
