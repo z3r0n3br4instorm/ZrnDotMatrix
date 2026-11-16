@@ -43,9 +43,8 @@ It's also easy on the battery. The screen only redraws when something on it actu
 | Swipe left | RIGEL |
 | Swipe right | Quick settings |
 | Tap the arrow at the bottom | App drawer |
-| Hold anywhere on the home screen | Palettes and AMOLED mode |
+| Hold anywhere on the home screen | Palettes, AMOLED mode and settings |
 | Hold the middle of the home screen | Talk to RIGEL without leaving home |
-| Swipe up with three fingers | Settings |
 
 ## Install
 

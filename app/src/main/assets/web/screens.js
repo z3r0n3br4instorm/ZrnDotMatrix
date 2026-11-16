@@ -26,11 +26,10 @@ const GUIDE_PAGES = [
     title: 'GESTURES',
     lines: [
       ['TAP', 'RIPPLE / ACTIVATE'],
-      ['HOLD', 'THEME PICKER'],
+      ['HOLD', 'THEME / SETTINGS'],
       ['SWIPE UP', 'APP DRAWER'],
       ['SWIPE RIGHT', 'QUICK SETTINGS'],
       ['SWIPE LEFT', 'RIGEL ASSISTANT'],
-      ['3-FINGER UP', 'SETTINGS'],
       ['BACK', 'RETURN HOME']
     ]
   },
@@ -67,7 +66,7 @@ const GUIDE_PAGES = [
       ['SYSTEM STATS', 'IDLE WIDGET'],
       ['EVENT BANNERS', 'CONNECT POPUPS'],
       ['HAPTICS', 'OFF LOW MED HIGH'],
-      ['', 'REACH: 3-FINGER UP']
+      ['', 'HOLD HOME FOR MENU']
     ]
   }
 ];
