@@ -137,32 +137,9 @@
       .catch(() => {});
   }
 
-  // ---- input: tap / hold (600 ms) / drag / 3-finger swipe up ----
+  // ---- input: tap / hold (600 ms) / drag ----
   let down = null, holdT = null;
-  let threeY0 = null;
   const pos = (e) => { const t = e.changedTouches ? e.changedTouches[0] : e; return [t.clientX, t.clientY]; };
-
-  window.addEventListener('touchstart', (e) => {
-    if (e.touches && e.touches.length === 3) {
-      threeY0 = (e.touches[0].clientY + e.touches[1].clientY + e.touches[2].clientY) / 3;
-    } else {
-      threeY0 = null;
-    }
-  }, { passive: true });
-
-  window.addEventListener('touchmove', (e) => {
-    if (threeY0 !== null && e.touches && e.touches.length === 3) {
-      const curY = (e.touches[0].clientY + e.touches[1].clientY + e.touches[2].clientY) / 3;
-      if (threeY0 - curY > 50) {
-        threeY0 = null;
-        if (down) { clearTimeout(holdT); down = null; }
-        L.openSettings();
-      }
-    }
-  }, { passive: true });
-
-  window.addEventListener('touchend', () => { threeY0 = null; }, { passive: true });
-  window.addEventListener('touchcancel', () => { threeY0 = null; }, { passive: true });
 
   // Desktop keyboard shortcut for testing: S key
   window.addEventListener('keydown', (e) => {

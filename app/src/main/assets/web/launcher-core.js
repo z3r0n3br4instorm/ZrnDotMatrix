@@ -2325,7 +2325,11 @@ class Launcher {
       this.nudge(300);
     }]);
 
-    g.frame(22, my + 38, 45, my + 48, 3); g.text3c('DONE', 33.5, my + 41, 1);
-    this.hits.push([22, my + 38, 45, my + 48, () => this.go('home')]);
+    g.frame(10, my + 38, 57, my + 50, 1);
+    g.text3c('SETTINGS', 33.5, my + 42, 1);
+    this.hits.push([10, my + 38, 57, my + 50, () => this.openSettings()]);
+
+    g.frame(22, my + 56, 45, my + 66, 3); g.text3c('DONE', 33.5, my + 59, 1);
+    this.hits.push([22, my + 56, 45, my + 66, () => this.go('home')]);
   }
 }
